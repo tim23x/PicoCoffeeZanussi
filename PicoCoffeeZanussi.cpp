@@ -1,14 +1,19 @@
 // Controller for a Zanussi ZCOF637X espresso machine.
 //
 // Hardware: MAX6675 thermocouple (SPI0), SH1106 128x64 OLED (I2C0), active-high
-// relays for heater / pump / group solenoid / grinder, four active-high buttons.
+// relays for heater / pump / group solenoid / grinder plus two spares, four active-high buttons,
+// and a WS2812 chain (PIO): a lamp ring, then the status LEDs. Either the OLED or the
+// status LEDs can be left out.
 // Logging goes to stdio: UART0 (GP0 TX, GP1 RX, 115200) for the Debug Probe, and USB.
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include "hardware/i2c.h"
+#include "hardware/pio.h"
+#include "ws2812.pio.h"
 
 // ---------------------------------------------------------------------------
 // Pins
@@ -25,9 +30,14 @@
 #define OLED_ADDRESS 0x3C
 
 constexpr uint HEATER_PIN = 2;
-constexpr uint PUMP_PIN = 3;
+constexpr uint GRINDER_PIN = 3;
 constexpr uint SOLENOID_PIN = 4;
-constexpr uint GRINDER_PIN = 5;
+constexpr uint PUMP_PIN = 5;
+constexpr uint SPARE1_PIN = 6;  // spare relay outputs, held off
+constexpr uint SPARE2_PIN = 7;
+constexpr uint LED_PIN = 10;    // one WS2812 chain: the lamp ring first, then the status LEDs
+constexpr int RING_COUNT = 16;
+constexpr int LED_COUNT = 7;
 constexpr uint GRIND_BUTTON_PIN = 18;
 constexpr uint COFFEE_BUTTON_PIN = 19;
 constexpr uint WATER_BUTTON_PIN = 20;
@@ -60,6 +70,12 @@ constexpr uint32_t SENSOR_PERIOD_MS = 250; // MAX6675 needs >= 220 ms per conver
 constexpr int SENSOR_FAULT_COUNT = 3;
 constexpr uint32_t DISPLAY_PERIOD_MS = 250;
 constexpr uint32_t STATUS_LOG_MS = 2000;
+constexpr uint32_t LED_PERIOD_MS = 20;
+constexpr uint8_t LED_BRIGHTNESS = 64;   // 0-255; WS2812s are dazzling at full power
+constexpr uint8_t RING_R = 255, RING_G = 160, RING_B = 60;  // lamp colour: warm white
+constexpr uint8_t RING_BRIGHTNESS = 128; // lamp brightness, 0-255
+constexpr uint8_t LED_TEST_BRIGHTNESS = 16; // start-up test; all white is ~90 mA, safe on USB power
+constexpr float AMBIENT_C = 20.0f;       // where the heating bar starts from
 
 static uint32_t millis() { return to_ms_since_boot(get_absolute_time()); }
 
@@ -500,7 +516,7 @@ static void run_state_machine(Machine& m, const ButtonEvents& b, uint32_t now) {
 // ---------------------------------------------------------------------------
 
 static void relays_init() {
-    const uint pins[] = {HEATER_PIN, PUMP_PIN, SOLENOID_PIN, GRINDER_PIN};
+    const uint pins[] = {HEATER_PIN, PUMP_PIN, SOLENOID_PIN, GRINDER_PIN, SPARE1_PIN, SPARE2_PIN};
     for (uint pin : pins) {
         gpio_init(pin);
         gpio_put(pin, 0);  // off before the pin becomes an output
@@ -557,6 +573,144 @@ static void render(const Machine& m, uint32_t now) {
 }
 
 // ---------------------------------------------------------------------------
+// LEDs: the lamp ring, then the status LEDs, where colour says which state
+// and the bar says how far along it is
+// ---------------------------------------------------------------------------
+
+enum class LedPattern {
+    Off,
+    Breathe,    // whole strip pulses slowly
+    Solid,      // whole strip on
+    WarmUp,     // bar fills as the temperature moves from from_c to the state's target
+    Countdown,  // bar empties as the state's timer runs out
+    Shot,       // bar fills across the whole shot: pre-infuse, soak and extract
+    Flash,      // blinks; the number of LEDs is the FaultReason (1 sensor, 2 over temp, 3 timeout)
+};
+
+struct LedStyle {
+    uint8_t r, g, b;
+    LedPattern pattern;
+    float from_c;  // WarmUp only
+};
+
+static const LedStyle LED_STYLES[] = {
+    //  r    g    b    pattern                 from
+    { 60,  60,  60,  LedPattern::Breathe,   0},             // STANDBY     dim white
+    {255,  70,   0,  LedPattern::WarmUp,    AMBIENT_C},     // HEATING     orange
+    {  0, 255,   0,  LedPattern::Solid,     0},             // READY       green
+    {255, 200,   0,  LedPattern::Countdown, 0},             // GRINDING    yellow
+    {255, 255, 255,  LedPattern::Shot,      0},             // PREINFUSE   white
+    {255, 255, 255,  LedPattern::Shot,      0},             // SOAK        white
+    {255, 255, 255,  LedPattern::Shot,      0},             // BREWING     white
+    {  0, 255, 255,  LedPattern::Countdown, 0},             // HOT WATER   cyan
+    {  0,   0, 255,  LedPattern::WarmUp,    BREW_TEMP_C},   // STEAM HEAT  blue
+    {  0,   0, 255,  LedPattern::Solid,     0},             // STEAM RDY   blue
+    {255,   0, 255,  LedPattern::WarmUp,    STEAM_TEMP_C},  // COOL DOWN   magenta, fills as it cools
+    {255,   0,   0,  LedPattern::Flash,     0},             // FAULT       red
+};
+static_assert(sizeof(LED_STYLES) / sizeof(LED_STYLES[0]) == (size_t)State::COUNT, "LED_STYLES table out of sync");
+
+static PIO led_pio;
+static uint led_sm;
+static bool leds_ok = false;
+
+static bool leds_init() {
+    uint offset;
+    if (!pio_claim_free_sm_and_add_program_for_gpio_range(&ws2812_program, &led_pio, &led_sm, &offset,
+                                                          LED_PIN, 1, true)) {
+        return false;
+    }
+    ws2812_program_init(led_pio, led_sm, offset, LED_PIN, 800000);
+    return true;
+}
+
+static void put_pixel(uint8_t r, uint8_t g, uint8_t b, float k) {
+    uint32_t rr = (uint32_t)(r * k), gg = (uint32_t)(g * k), bb = (uint32_t)(b * k);
+    pio_sm_put_blocking(led_pio, led_sm, (gg << 24) | (rr << 16) | (bb << 8));  // GRB, MSB first
+}
+
+// 0.1 .. 1.0 and back over period_ms, eased so the dim end doesn't look like a step.
+static float pulse(uint32_t now, uint32_t period_ms) {
+    float tri = (float)(now % period_ms) / period_ms * 2.0f;
+    if (tri > 1.0f) tri = 2.0f - tri;
+    return 0.1f + 0.9f * tri * tri;
+}
+
+static void leds_render(const Machine& m, uint32_t now) {
+    const LedStyle& st = LED_STYLES[(int)m.state];
+    const StateInfo& si = info(m.state);
+    uint32_t in_state = now - m.entered_ms;
+    float level[LED_COUNT] = {};
+    float fill = -1.0f;  // >= 0 for the bar patterns
+
+    switch (st.pattern) {
+        case LedPattern::Off:
+            break;
+        case LedPattern::Breathe:
+            for (float& l : level) l = pulse(now, 4000);
+            break;
+        case LedPattern::Solid:
+            for (float& l : level) l = 1.0f;
+            break;
+        case LedPattern::WarmUp:
+            fill = m.temp_valid ? (m.temp_c - st.from_c) / (si.target_c - st.from_c) : 0.0f;
+            break;
+        case LedPattern::Countdown:
+            fill = 1.0f - (float)in_state / si.timer_ms;
+            break;
+        case LedPattern::Shot: {
+            // Earlier stages always ran their full time, or we'd have gone back to Ready.
+            uint32_t done = in_state;
+            if (m.state != State::Preinfuse) done += PREINFUSE_MS;
+            if (m.state == State::Brewing) done += SOAK_MS;
+            fill = (float)done / (PREINFUSE_MS + SOAK_MS + BREW_MS);
+            break;
+        }
+        case LedPattern::Flash:
+            if (now % 1000 < 500) {
+                for (int i = 0; i < (int)m.fault && i < LED_COUNT; ++i) level[i] = 1.0f;
+            }
+            break;
+    }
+
+    if (fill >= 0.0f) {
+        // Always at least one LED, and the leading one pulses so the bar never looks stuck.
+        int lit = (int)ceilf(fill * LED_COUNT);
+        if (lit < 1) lit = 1;
+        if (lit > LED_COUNT) lit = LED_COUNT;
+        for (int i = 0; i < lit - 1; ++i) level[i] = 1.0f;
+        level[lit - 1] = pulse(now, 1000);
+    }
+
+    // The ring replaces the original lamp: on whenever the machine is.
+    float ring = m.state == State::Standby ? 0.0f : RING_BRIGHTNESS / 255.0f;
+    for (int i = 0; i < RING_COUNT; ++i) put_pixel(RING_R, RING_G, RING_B, ring);
+    for (float l : level) put_pixel(st.r, st.g, st.b, l * LED_BRIGHTNESS / 255.0f);
+}
+
+// Start-up check of the whole chain: every LED red, green, blue and white for 1 s each
+// (one colour channel at a time), then one white LED walks from the first ring LED to the last
+// status LED (wiring order and count). Repeats until a button is pressed.
+static void leds_test_render(uint32_t elapsed) {
+    static const uint8_t colours[][3] = {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 255}};
+    constexpr int COLOURS = sizeof(colours) / sizeof(colours[0]);
+    constexpr int TOTAL = RING_COUNT + LED_COUNT;
+    constexpr uint32_t COLOUR_MS = 1000, STEP_MS = 150;
+    uint32_t t = elapsed % (COLOURS * COLOUR_MS + TOTAL * STEP_MS);
+    float k = LED_TEST_BRIGHTNESS / 255.0f;
+
+    for (int i = 0; i < TOTAL; ++i) {
+        if (t < COLOURS * COLOUR_MS) {
+            const uint8_t* c = colours[t / COLOUR_MS];
+            put_pixel(c[0], c[1], c[2], k);
+        } else {
+            bool lit = i == (int)((t - COLOURS * COLOUR_MS) / STEP_MS);
+            put_pixel(255, 255, 255, lit ? k : 0.0f);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -589,10 +743,17 @@ int main() {
     oled_ok = oled_init();
     LOG("OLED at 0x%02X %s", OLED_ADDRESS, oled_ok ? "OK" : "not responding");
 
+    leds_ok = leds_init();
+    LOG("Lamp ring and status LEDs on GP%d %s", LED_PIN, leds_ok ? "OK" : "failed: no free PIO state machine");
+
     Machine m;
     uint32_t now = millis();
     m.entered_ms = m.activity_ms = now;
     uint32_t next_sample = now, next_display = now, next_status = now, next_oled_retry = now + 5000;
+    uint32_t next_leds = now;
+    uint32_t led_test_start = now;
+    bool led_test = leds_ok;
+    if (led_test) LOG("LED test pattern running, press any button to stop");
 
     LOG("State: %s", info(m.state).name);
 
@@ -600,6 +761,15 @@ int main() {
         now = millis();
 
         ButtonEvents b = buttons_poll(now);
+        if (led_test) {
+            for (bool pressed : b.pressed) {
+                if (pressed) led_test = false;
+            }
+            if (!led_test) {
+                b = {};  // the press that ends the test doesn't also wake the machine
+                LOG("LED test stopped");
+            }
+        }
 
         bool sampled = false;
         if ((int32_t)(now - next_sample) >= 0) {
@@ -646,6 +816,12 @@ int main() {
                     LOG("OLED write failed");
                 }
             }
+        }
+
+        if (leds_ok && (int32_t)(now - next_leds) >= 0) {
+            next_leds += LED_PERIOD_MS;
+            if (led_test) leds_test_render(now - led_test_start);
+            else leds_render(m, now);
         }
 
         sleep_ms(2);

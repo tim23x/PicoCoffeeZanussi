@@ -14,7 +14,8 @@ Replacement controller for a **Zanussi ZCOF637X** espresso machine, built on a R
 - Heater control with hysteresis, driven by a K-type thermocouple.
 - Safety faults that turn everything off and stay off until reset: thermocouple failure, over-temperature, and heating that takes too long.
 - Automatic standby when the machine is left idle.
-- 128x64 OLED status display.
+- Status shown on a strip of 7 WS2812 (NeoPixel) LEDs, a 128x64 OLED, or both.
+- A 16-LED NeoPixel ring in place of the original halogen lamp.
 - Serial log of every button press, state change and fault.
 
 ## Hardware
@@ -23,8 +24,11 @@ Replacement controller for a **Zanussi ZCOF637X** espresso machine, built on a R
 |---|---|
 | Raspberry Pi Pico 2 W (RP2350) | The original Pico (RP2040) also works if you change `PICO_BOARD` in `CMakeLists.txt` |
 | MAX6675 module + K-type thermocouple | Mounted on the boiler/thermoblock |
-| 1.3" SH1106 128x64 I2C OLED | A 0.96" SSD1306 also works, see [Configuration](#configuration) |
-| 4-channel relay module, active-high | Heater, pump, group solenoid, grinder. Must be rated for mains loads |
+| 16-LED WS2812B ring | Replaces the halogen lamp. First in the LED chain |
+| 7 x WS2812B LEDs (NeoPixel strip or individual pixels) | Status display, chained after the ring. Optional if you fit the OLED |
+| 1.3" SH1106 128x64 I2C OLED | Optional if you fit the LEDs. A 0.96" SSD1306 also works, see [Configuration](#configuration) |
+| 4-channel relay module, active-high | Heater, grinder, group solenoid, pump. Must be rated for mains loads |
+| Carrier PCB with 5 V rail + 5 V 5 A DC supply | Powers the Pico, relay coils and LEDs |
 | 4 momentary push buttons | Grind, Coffee, Water, Steam |
 | Raspberry Pi Debug Probe (optional) | For flashing, debugging and the serial log |
 
@@ -35,9 +39,12 @@ All signals are 3.3 V. Physical pin numbers are for the Pico 2 W.
 | Function | GPIO | Pin | Connects to |
 |---|---|---|---|
 | Heater relay | GP2 | 4 | Relay IN1 |
-| Pump relay | GP3 | 5 | Relay IN2 |
+| Grinder relay | GP3 | 5 | Relay IN2 |
 | Group solenoid relay | GP4 | 6 | Relay IN3 |
-| Grinder relay | GP5 | 7 | Relay IN4 |
+| Pump relay | GP5 | 7 | Relay IN4 |
+| Spare relay 1 | GP6 | 9 | Spare relay IN (held off) |
+| Spare relay 2 | GP7 | 10 | Spare relay IN (held off) |
+| LED data | GP10 | 14 | Ring DIN, through a 330 Ω resistor. Ring DOUT goes to the first status LED's DIN |
 | OLED SDA | GP8 | 11 | OLED SDA |
 | OLED SCL | GP9 | 12 | OLED SCL |
 | Thermocouple data | GP16 (SPI0 RX) | 21 | MAX6675 SO |
@@ -50,10 +57,12 @@ All signals are 3.3 V. Physical pin numbers are for the Pico 2 W.
 | Serial log TX | GP0 | 1 | Debug Probe UART RX |
 | Serial log RX | GP1 | 2 | Debug Probe UART TX |
 
-Power:
+Power: the Pico sits on a carrier PCB with a 5 V rail, fed by a 5 V 5 A DC supply. The rail powers the Pico, the relay coils and the LEDs.
 
+- **Pico:** 5 V rail to **VBUS (pin 40)**. VBUS is wired straight to the Pico's USB connector, so while the supply is on, don't plug the Pico's USB into a PC: the PC's 5 V and the rail would be joined, and either could back-feed the other. Flash and read the serial log through the Debug Probe instead (it connects through SWD and UART, not the Pico's USB). If you need USB, switch the supply off first, or use a USB cable or adapter with the 5 V line cut.
 - **OLED and MAX6675:** VCC to **3V3(OUT), pin 36**, GND to any GND pin. Don't power the OLED from 5 V: its on-board pull-ups would put 5 V on GP8/GP9.
-- **Relay module:** the coils need 5 V from **VBUS (pin 40)** or an external supply, not the Pico's 3.3 V regulator. Only the IN signals connect to the GPIOs.
+- **Relay module:** the coils run from the 5 V rail, not the Pico's 3.3 V regulator. Only the IN signals connect to the GPIOs.
+- **Ring and status LEDs:** 5 V and GND from the rail, not through the Pico. They draw about 0.4 A at the default brightness and up to about 1.4 A at full white, well within the 5 A supply. A 100-1000 µF capacitor across the LEDs' 5 V and GND is good practice. Most WS2812Bs accept the Pico's 3.3 V data signal on a short wire. If yours flicker or show the wrong colours, add a 74AHCT125 level shifter.
 - **Buttons:** each one connects its GPIO to 3V3. The firmware turns on the internal pull-downs, so you don't need resistors.
 
 ## Using the machine
@@ -68,6 +77,29 @@ Power:
 Any button wakes the machine from standby. It heats to brew temperature and shows **READY** when it's there. For steam, wait for **STEAM RDY**, then open the steam knob. When you leave steam mode the machine shows **COOL DOWN** until it's back to brew temperature. Pressing Water during cool-down flushes water through the wand to speed this up.
 
 The display shows the state, the current and target temperature, a countdown for timed steps, and a hint for what to press next.
+
+### Status LEDs
+
+The colour shows the state. On a progress bar, the number of lit LEDs shows how far along it is, and the leading LED pulses.
+
+| State | Colour | Pattern |
+|---|---|---|
+| Standby | Dim white | Whole strip breathes slowly |
+| Heating | Orange | Bar fills as the temperature rises from 20 °C to brew temperature |
+| Ready | Green | All on |
+| Grinding | Yellow | Bar empties as the grind time runs out |
+| Pre-infuse, Soak, Brewing | White | Bar fills across the whole shot |
+| Hot Water | Cyan | Bar empties as the run time runs out |
+| Steam Heat | Blue | Bar fills as the temperature rises from brew to steam temperature |
+| Steam Ready | Blue | All on |
+| Cool Down | Magenta | Bar fills as the block cools back to brew temperature |
+| Fault | Red | Flashing. 1 LED: thermocouple, 2 LEDs: over-temperature, 3 LEDs: heat timeout |
+
+Bars fill from the status LED nearest the ring.
+
+The ring lights warm white whenever the machine is on, and goes off in standby.
+
+At start-up all the LEDs run a test pattern until you press any button. That press only stops the test, it doesn't wake the machine. The test lights every LED red, green, blue, then white for 1 s each, which checks every colour channel. Then a single white LED walks from the first ring LED to the last status LED, which checks the wiring order and the LED count. The test runs at low brightness (`LED_TEST_BRIGHTNESS`), so it draws only about 90 mA and can run from the Pico's USB alone.
 
 ## State machine
 
@@ -108,6 +140,7 @@ Everything is in [`PicoCoffeeZanussi.cpp`](PicoCoffeeZanussi.cpp):
 - **`STATES` table:** one row per state. It sets the heater target, which relays are on, the state's timer and idle timeout, and the hint shown on the display. To change what a state does, edit its row.
 - **`collect_events()`:** turns button presses, timers, temperature readings and fault conditions into events, with safety events first.
 - **`next_state()`:** the transition table, and the only place where states change. The machine makes at most one transition per loop.
+- **`LED_STYLES` table:** the colour and pattern for each state on the status LEDs.
 - **`update_heater()`:** on/off control with hysteresis toward the current state's target. The heater turns off whenever the temperature reading is invalid.
 
 ## Building and flashing
@@ -118,7 +151,7 @@ This project uses the [Raspberry Pi Pico VS Code extension](https://marketplace.
 2. Click **Compile** in the status bar, or run `ninja` in `build/`.
 3. Flash by one of these methods:
    - **Debug Probe:** use **Run → Start Debugging**, or the extension's **Run** button.
-   - **USB:** hold BOOTSEL while plugging in the Pico, then copy `build/PicoCoffeeZanussi.uf2` to the drive that appears.
+   - **USB:** with the 5 V supply off (see [Wiring](#wiring)), hold BOOTSEL while plugging in the Pico, then copy `build/PicoCoffeeZanussi.uf2` to the drive that appears.
 
 ## Serial log
 
@@ -148,6 +181,12 @@ All settings are constants at the top of `PicoCoffeeZanussi.cpp`.
 | `HOT_WATER_MS` | 30 s | Maximum hot water run |
 | `HEAT_TIMEOUT_MS` | 5 min | Fault if not at temperature by then |
 | `IDLE_MS` / `STEAM_IDLE_MS` | 30 min / 3 min | Auto standby / leave steam mode |
+| `RING_COUNT` | 16 | Number of LEDs in the lamp ring |
+| `RING_R` / `RING_G` / `RING_B` | 255 / 160 / 60 | Lamp colour (warm white) |
+| `RING_BRIGHTNESS` | 128 | Lamp brightness, 0-255 |
+| `LED_COUNT` | 7 | Number of status LEDs |
+| `LED_BRIGHTNESS` | 64 | Status LED brightness, 0-255 |
+| `LED_TEST_BRIGHTNESS` | 16 | Brightness of the start-up LED test, 0-255 |
 | `OLED_COLUMN_OFFSET` | 2 | 2 for an SH1106 (1.3"), 0 for an SSD1306 (0.96") |
 | `OLED_ADDRESS` | `0x3C` | Some modules use `0x3D` |
 

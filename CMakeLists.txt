@@ -37,6 +37,8 @@ pico_sdk_init()
 
 add_executable(PicoCoffeeZanussi PicoCoffeeZanussi.cpp )
 
+pico_generate_pio_header(PicoCoffeeZanussi ${CMAKE_CURRENT_LIST_DIR}/ws2812.pio)
+
 pico_set_program_name(PicoCoffeeZanussi "PicoCoffeeZanussi")
 pico_set_program_version(PicoCoffeeZanussi "0.1")
 
@@ -57,6 +59,7 @@ target_include_directories(PicoCoffeeZanussi PRIVATE
 target_link_libraries(PicoCoffeeZanussi 
         hardware_spi
         hardware_i2c
+        hardware_pio
         pico_cyw43_arch_none
         )
 
