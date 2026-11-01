@@ -47,13 +47,24 @@ constexpr uint STEAM_BUTTON_PIN = 21;
 // Tuning
 // ---------------------------------------------------------------------------
 
+// Temporary: replaces normal operation with a relay test. Set to false to use the machine.
+constexpr bool RELAY_TEST_MODE = true;
+
 constexpr float BREW_TEMP_C = 95.0f;
 constexpr float STEAM_TEMP_C = 140.0f;
-constexpr float HYSTERESIS_C = 1.0f;     // heater on below target - this, off at target
 constexpr float READY_BAND_C = 2.0f;     // this close to target counts as "at temperature"
 constexpr float REHEAT_BAND_C = 8.0f;    // Ready falls back to Heating this far below brew temp
 constexpr float COOLED_BAND_C = 3.0f;    // after steam, brewing allowed again within this of brew temp
 constexpr float OVER_TEMP_C = 165.0f;    // hard cutoff
+
+// Heater: PID sets a power level, delta-sigma turns it into whole mains cycles. Needs an SSR:
+// a mechanical relay would be switching several times a second. The gains are starting
+// points, tune them on the machine.
+constexpr float HEATER_KP = 0.08f;       // power per C below target (12.5 C below = full power)
+constexpr float HEATER_KI = 0.002f;      // power per C-second of accumulated error
+constexpr float HEATER_KD = 0.2f;        // power taken off per C/s of temperature rise
+constexpr uint32_t HEATER_STEP_MS = 20;  // one mains cycle: 20 for 50 Hz, 17 for 60 Hz
+constexpr uint32_t HEATER_STALE_MS = 1000; // heater off if the main loop stops updating the power
 
 constexpr uint32_t GRIND_MS = 12 * 1000;
 constexpr uint32_t PREINFUSE_MS = 3 * 1000;
@@ -368,7 +379,6 @@ struct Machine {
     float temp_c = 0.0f;
     bool temp_valid = false;
     int sensor_errors = 0;
-    bool heater = false;
 };
 
 static bool fault_cleared(const Machine& m) {
@@ -524,17 +534,73 @@ static void relays_init() {
     }
 }
 
-// Bang-bang with hysteresis. Fails safe to off whenever the reading is invalid.
-static void update_heater(Machine& m) {
+// Heater power, 0..1. Set by update_heater() in the main loop, used by the heater timer interrupt.
+static volatile float heater_power = 0.0f;
+static volatile uint32_t heater_power_ms = 0;  // when heater_power was last set
+
+struct Pid {
+    float integral;      // the I term, already scaled by HEATER_KI
+    float last_temp_c;
+    float rate_c_per_s;  // smoothed rate of temperature change
+    bool primed;         // last_temp_c is valid
+};
+static Pid pid;
+
+// PID toward the current state's target. Called on every new reading (sampled) and on every
+// state change. The D term works on the temperature, not the error, so a target change such as
+// brew -> steam doesn't kick the output. Fails safe to zero power when there's no target or
+// the reading is invalid.
+static void update_heater(const Machine& m, bool sampled) {
     float target = info(m.state).target_c;
-    if (target <= 0 || !m.temp_valid) m.heater = false;
-    else if (m.temp_c >= target) m.heater = false;
-    else if (m.temp_c <= target - HYSTERESIS_C) m.heater = true;
+    float power = 0.0f;
+    if (target <= 0 || !m.temp_valid) {
+        pid = {};
+    } else {
+        constexpr float dt = SENSOR_PERIOD_MS / 1000.0f;
+        float error = target - m.temp_c;
+        if (sampled) {
+            if (pid.primed) {
+                // The MAX6675 reads in 0.25 C steps, so smooth the rate before using it.
+                float rate = (m.temp_c - pid.last_temp_c) / dt;
+                pid.rate_c_per_s += 0.2f * (rate - pid.rate_c_per_s);
+            }
+            pid.last_temp_c = m.temp_c;
+            pid.primed = true;
+
+            // Anti-windup: don't integrate further into a limit the output is already at.
+            float out = HEATER_KP * error + pid.integral - HEATER_KD * pid.rate_c_per_s;
+            if ((out < 1.0f || error < 0) && (out > 0.0f || error > 0)) {
+                pid.integral += HEATER_KI * error * dt;
+                if (pid.integral < 0.0f) pid.integral = 0.0f;
+                if (pid.integral > 1.0f) pid.integral = 1.0f;
+            }
+        }
+        power = HEATER_KP * error + pid.integral - HEATER_KD * pid.rate_c_per_s;
+        if (power < 0.0f) power = 0.0f;
+        if (power > 1.0f) power = 1.0f;
+    }
+    heater_power = power;
+    heater_power_ms = millis();
+    if (power == 0.0f) gpio_put(HEATER_PIN, 0);  // off now, not at the next mains cycle
+}
+
+// Delta-sigma, once per mains cycle from a timer interrupt: add the demanded power to an
+// accumulator, and switch on for this cycle whenever it reaches a whole cycle. This spreads
+// the on-cycles as evenly as possible. Stepping whole cycles keeps the current symmetrical.
+static bool heater_step(repeating_timer_t*) {
+    static float accumulator = 0.0f;
+    float power = heater_power;
+    if (millis() - heater_power_ms > HEATER_STALE_MS) power = 0.0f;  // main loop has stopped
+    accumulator += power;
+    bool on = accumulator >= 1.0f;
+    if (on) accumulator -= 1.0f;
+    if (power == 0.0f) accumulator = 0.0f;
+    gpio_put(HEATER_PIN, on);
+    return true;
 }
 
 static void drive_relays(const Machine& m) {
     const StateInfo& si = info(m.state);
-    gpio_put(HEATER_PIN, m.heater);
     gpio_put(PUMP_PIN, si.pump);
     gpio_put(SOLENOID_PIN, si.valve);
     gpio_put(GRINDER_PIN, si.grinder);
@@ -556,7 +622,7 @@ static void render(const Machine& m, uint32_t now) {
     draw_text(0, 3, line);
 
     if (si.target_c > 0) {
-        snprintf(line, sizeof(line), "SET  %3d C  %s", (int)si.target_c, m.heater ? "HEAT" : "");
+        snprintf(line, sizeof(line), "SET  %3d C  %3d%%", (int)si.target_c, (int)(heater_power * 100.0f + 0.5f));
         draw_text(0, 4, line);
     }
 
@@ -711,6 +777,71 @@ static void leds_test_render(uint32_t elapsed) {
 }
 
 // ---------------------------------------------------------------------------
+// Relay test (RELAY_TEST_MODE)
+// ---------------------------------------------------------------------------
+
+// Each relay is on only while its button is held: STEAM = group solenoid, WATER = pump.
+// Runs instead of the state machine and never returns; the heater and grinder stay off.
+static void relay_test() {
+    struct TestRelay {
+        const char* name;
+        uint pin;
+        ButtonId button;
+        bool on;
+    };
+    TestRelay relays[] = {
+        {"PUMP", PUMP_PIN, BTN_WATER},
+        {"SOLENOID", SOLENOID_PIN, BTN_STEAM},
+    };
+
+    LOG("RELAY TEST MODE: hold WATER = pump, hold STEAM = solenoid");
+    uint32_t now = millis();
+    uint32_t next_display = now, next_leds = now;
+    while (true) {
+        now = millis();
+        buttons_poll(now);
+
+        for (TestRelay& r : relays) {
+            bool on = buttons[r.button].down;  // debounced
+            if (on != r.on) {
+                r.on = on;
+                gpio_put(r.pin, on);
+                LOG("Relay test: %s %s", r.name, on ? "ON" : "OFF");
+            }
+        }
+
+        if (oled_ok && (int32_t)(now - next_display) >= 0) {
+            next_display += DISPLAY_PERIOD_MS;
+            char line[22];
+            memset(oled_buf, 0, sizeof(oled_buf));
+            draw_big(0, 0, "RELAY TEST");
+            for (int i = 0; i < 2; ++i) {
+                snprintf(line, sizeof(line), "%-9s %s", relays[i].name, relays[i].on ? "ON" : "OFF");
+                draw_text(0, 3 + i, line);
+            }
+            draw_text(0, 6, "HOLD WATER - PUMP");
+            draw_text(0, 7, "HOLD STEAM - SOLENOID");
+            if (!oled_flush()) {
+                oled_ok = false;
+                LOG("OLED write failed");
+            }
+        }
+
+        // Ring off. Status LED 1 cyan = pump on, LED 2 white = solenoid on, the rest dim magenta.
+        if (leds_ok && (int32_t)(now - next_leds) >= 0) {
+            next_leds += LED_PERIOD_MS;
+            float k = LED_BRIGHTNESS / 255.0f;
+            for (int i = 0; i < RING_COUNT; ++i) put_pixel(0, 0, 0, 0.0f);
+            put_pixel(0, 255, 255, relays[0].on ? k : 0.0f);
+            put_pixel(255, 255, 255, relays[1].on ? k : 0.0f);
+            for (int i = 2; i < LED_COUNT; ++i) put_pixel(255, 0, 255, k * 0.25f);
+        }
+
+        sleep_ms(2);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -721,6 +852,10 @@ int main() {
 
     printf("\r\n\r\n=== Zanussi ZCOF637X controller ===\r\n");
     LOG("stdio up (UART0 GP0/GP1 @ 115200 and USB)");
+#if PICO_RP2350
+    // A2 has erratum E9: inputs held low only by the internal pull-down can read high.
+    LOG("RP2350 stepping %s", rp2350_chip_version() == 2 ? "A2 (erratum E9 present)" : "A3/A4 (E9 fixed)");
+#endif
 
     buttons_init();
     thermocouple_init();
@@ -745,6 +880,12 @@ int main() {
 
     leds_ok = leds_init();
     LOG("Lamp ring and status LEDs on GP%d %s", LED_PIN, leds_ok ? "OK" : "failed: no free PIO state machine");
+
+    if (RELAY_TEST_MODE) relay_test();
+
+    static repeating_timer_t heater_timer;
+    // Negative period: a fixed interval between starts, so the cycles don't drift.
+    add_repeating_timer_ms(-(int32_t)HEATER_STEP_MS, heater_step, nullptr, &heater_timer);
 
     Machine m;
     uint32_t now = millis();
@@ -791,15 +932,16 @@ int main() {
 
         State before = m.state;
         run_state_machine(m, b, now);
-        if (sampled || m.state != before) update_heater(m);
+        if (sampled || m.state != before) update_heater(m, sampled);
         drive_relays(m);
 
         if ((int32_t)(now - next_status) >= 0) {
             next_status += STATUS_LOG_MS;
             const StateInfo& si = info(m.state);
-            LOG("%-10s temp=%s%.2f C set=%.0f heater=%d pump=%d valve=%d grinder=%d oled=%d",
-                si.name, m.temp_valid ? "" : "INVALID ", m.temp_c, si.target_c,
-                m.heater, si.pump, si.valve, si.grinder, oled_ok);
+            LOG("%-10s temp=%s%.2f C set=%.0f power=%.0f%% (P=%.2f I=%.2f rate=%.2f C/s) pump=%d valve=%d grinder=%d oled=%d",
+                si.name, m.temp_valid ? "" : "INVALID ", m.temp_c, si.target_c, heater_power * 100.0f,
+                si.target_c > 0 ? HEATER_KP * (si.target_c - m.temp_c) : 0.0f, pid.integral, pid.rate_c_per_s,
+                si.pump, si.valve, si.grinder, oled_ok);
         }
 
         if ((int32_t)(now - next_display) >= 0) {

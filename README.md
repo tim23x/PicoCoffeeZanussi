@@ -11,7 +11,7 @@ Replacement controller for a **Zanussi ZCOF637X** espresso machine, built on a R
 - Timed grinding for one dose.
 - Hot water, and steam with its own higher temperature setting.
 - Cool-down after steaming, so you can't brew with an overheated block.
-- Heater control with hysteresis, driven by a K-type thermocouple.
+- PID heater control with delta-sigma output through a solid-state relay, driven by a K-type thermocouple.
 - Safety faults that turn everything off and stay off until reset: thermocouple failure, over-temperature, and heating that takes too long.
 - Automatic standby when the machine is left idle.
 - Status shown on a strip of 7 WS2812 (NeoPixel) LEDs, a 128x64 OLED, or both.
@@ -27,7 +27,8 @@ Replacement controller for a **Zanussi ZCOF637X** espresso machine, built on a R
 | 16-LED WS2812B ring | Replaces the halogen lamp. First in the LED chain |
 | 7 x WS2812B LEDs (NeoPixel strip or individual pixels) | Status display, chained after the ring. Optional if you fit the OLED |
 | 1.3" SH1106 128x64 I2C OLED | Optional if you fit the LEDs. A 0.96" SSD1306 also works, see [Configuration](#configuration) |
-| 4-channel relay module, active-high | Heater, grinder, group solenoid, pump. Must be rated for mains loads |
+| SSR-25 DA solid-state relay, on a heatsink | Heater. Must be a solid-state relay, see [Heater control](#heater-control) |
+| Relay module, active-high | Grinder, group solenoid, pump. Must be rated for mains loads |
 | Carrier PCB with 5 V rail + 5 V 5 A DC supply | Powers the Pico, relay coils and LEDs |
 | 4 momentary push buttons | Grind, Coffee, Water, Steam |
 | Raspberry Pi Debug Probe (optional) | For flashing, debugging and the serial log |
@@ -38,7 +39,7 @@ All signals are 3.3 V. Physical pin numbers are for the Pico 2 W.
 
 | Function | GPIO | Pin | Connects to |
 |---|---|---|---|
-| Heater relay | GP2 | 4 | Relay IN1 |
+| Heater SSR | GP2 | 4 | Darlington array input. The array output sinks the SSR's input −, and the SSR's input + goes to 5 V |
 | Grinder relay | GP3 | 5 | Relay IN2 |
 | Group solenoid relay | GP4 | 6 | Relay IN3 |
 | Pump relay | GP5 | 7 | Relay IN4 |
@@ -59,7 +60,7 @@ All signals are 3.3 V. Physical pin numbers are for the Pico 2 W.
 
 Power: the Pico sits on a carrier PCB with a 5 V rail, fed by a 5 V 5 A DC supply. The rail powers the Pico, the relay coils and the LEDs.
 
-- **Pico:** 5 V rail to **VBUS (pin 40)**. VBUS is wired straight to the Pico's USB connector, so while the supply is on, don't plug the Pico's USB into a PC: the PC's 5 V and the rail would be joined, and either could back-feed the other. Flash and read the serial log through the Debug Probe instead (it connects through SWD and UART, not the Pico's USB). If you need USB, switch the supply off first, or use a USB cable or adapter with the 5 V line cut.
+- **Pico:** 5 V rail to **VBUS (pin 40)**. The Pico's USB connector isn't used. For debugging, the board's VSYS (pin 39) connects to the debug board's VSYS, so the debug board can power the Pico when the supply is off. Both Picos have a diode from VBUS to VSYS, so with the supply and the debug board both connected, neither can back-feed the other's USB or the 5 V rail.
 - **OLED and MAX6675:** VCC to **3V3(OUT), pin 36**, GND to any GND pin. Don't power the OLED from 5 V: its on-board pull-ups would put 5 V on GP8/GP9.
 - **Relay module:** the coils run from the 5 V rail, not the Pico's 3.3 V regulator. Only the IN signals connect to the GPIOs.
 - **Ring and status LEDs:** 5 V and GND from the rail, not through the Pico. They draw about 0.4 A at the default brightness and up to about 1.4 A at full white, well within the 5 A supply. A 100-1000 µF capacitor across the LEDs' 5 V and GND is good practice. Most WS2812Bs accept the Pico's 3.3 V data signal on a short wire. If yours flicker or show the wrong colours, add a 74AHCT125 level shifter.
@@ -77,6 +78,21 @@ Power: the Pico sits on a carrier PCB with a 5 V rail, fed by a 5 V 5 A DC suppl
 Any button wakes the machine from standby. It heats to brew temperature and shows **READY** when it's there. For steam, wait for **STEAM RDY**, then open the steam knob. When you leave steam mode the machine shows **COOL DOWN** until it's back to brew temperature. Pressing Water during cool-down flushes water through the wand to speed this up.
 
 The display shows the state, the current and target temperature, a countdown for timed steps, and a hint for what to press next.
+
+### Relay test
+
+While `RELAY_TEST_MODE` is `true` at the top of `PicoCoffeeZanussi.cpp`, the firmware runs a relay test instead of the normal state machine. Each relay is on only while you hold its button:
+
+| Hold | Relay |
+|---|---|
+| **Steam** | Group solenoid |
+| **Water** | Pump |
+
+The heater and grinder stay off. The OLED and status LEDs show which relays are on: LED 1 is cyan for the pump and LED 2 is white for the solenoid. The other status LEDs glow dim magenta to show you're in test mode. The relay coils run from the 5 V rail, so the PSU must be on.
+
+Before running the pump, fill the water tank and put a cup under the group head. With the solenoid closed the pump feeds the steam wand, so open the steam knob and hold a jug under it too.
+
+Set `RELAY_TEST_MODE` to `false` and rebuild to use the machine normally.
 
 ### Status LEDs
 
@@ -141,7 +157,28 @@ Everything is in [`PicoCoffeeZanussi.cpp`](PicoCoffeeZanussi.cpp):
 - **`collect_events()`:** turns button presses, timers, temperature readings and fault conditions into events, with safety events first.
 - **`next_state()`:** the transition table, and the only place where states change. The machine makes at most one transition per loop.
 - **`LED_STYLES` table:** the colour and pattern for each state on the status LEDs.
-- **`update_heater()`:** on/off control with hysteresis toward the current state's target. The heater turns off whenever the temperature reading is invalid.
+- **`update_heater()`:** the PID controller. It sets the heater power toward the current state's target, and sets zero power whenever the temperature reading is invalid.
+- **`heater_step()`:** the delta-sigma output, run from a timer interrupt once per mains cycle.
+
+## Heater control
+
+The heater uses two layers of control:
+
+1. **PID:** on every thermocouple reading (every 250 ms), `update_heater()` sets a heater power from 0 to 100% toward the current state's target. The D term works on the temperature, not the error, so changing target (brew to steam) doesn't make the power jump. The I term stops growing while the output is already at 0% or 100%.
+2. **Delta-sigma:** once per mains cycle, a timer interrupt adds the power to an accumulator and switches the heater on for that cycle whenever the accumulator reaches a whole cycle. For 30% power, 3 cycles in every 10 are on, spread as evenly as possible. The interrupt runs on time even while the main loop is busy, and it switches the heater off if the main loop hasn't updated the power for 1 s.
+
+> [!IMPORTANT]
+> The heater must be on a solid-state relay. Delta-sigma switching would wear out a mechanical relay within days.
+
+The SSR is switched from 5 V through a Darlington array (ULN2003 or similar), so the Pico's pin only drives the array's input. The array turns on when GP2 is high, so the firmware's active-high output works without change. The array drops about 1 V, which leaves the SSR about 4 V, within its 3-32 V input range.
+
+### Tuning
+
+The default gains are starting points. Tune them with the machine cold, filled with water, and the serial log open. Each status line shows the power, the P and I terms, and the rate of temperature change.
+
+1. Set `HEATER_KI` and `HEATER_KD` to 0. Raise `HEATER_KP` until the temperature settles near the target without oscillating. It will settle a little below the target.
+2. Raise `HEATER_KD` to cut the overshoot when heating from cold. Thermoblocks overshoot because the thermocouple lags the heater.
+3. Raise `HEATER_KI` until the temperature settles on the target within a minute or two. Too much makes it oscillate slowly.
 
 ## Building and flashing
 
@@ -151,7 +188,7 @@ This project uses the [Raspberry Pi Pico VS Code extension](https://marketplace.
 2. Click **Compile** in the status bar, or run `ninja` in `build/`.
 3. Flash by one of these methods:
    - **Debug Probe:** use **Run → Start Debugging**, or the extension's **Run** button.
-   - **USB:** with the 5 V supply off (see [Wiring](#wiring)), hold BOOTSEL while plugging in the Pico, then copy `build/PicoCoffeeZanussi.uf2` to the drive that appears.
+   - **USB:** with the 5 V supply off, hold BOOTSEL while plugging in the Pico, then copy `build/PicoCoffeeZanussi.uf2` to the drive that appears.
 
 ## Serial log
 
@@ -164,7 +201,7 @@ Logging goes to both UART0 (GP0/GP1, 115200 baud) and USB. With a Debug Probe, o
 [  1.004] State: STANDBY
 [  4.512] Button COFFEE pressed
 [  4.512] STANDBY -> HEATING (COFFEE pressed, 21.50 C)
-[  5.004] HEATING    temp=22.25 C set=95 heater=1 pump=0 valve=0 grinder=0 oled=1
+[  5.004] HEATING    temp=22.25 C set=95 power=100% (P=5.82 I=0.00 rate=0.00 C/s) pump=0 valve=0 grinder=0 oled=1
 ```
 
 ## Configuration
@@ -173,12 +210,15 @@ All settings are constants at the top of `PicoCoffeeZanussi.cpp`.
 
 | Constant | Default | Purpose |
 |---|---|---|
+| `RELAY_TEST_MODE` | `true` | Temporary relay test instead of normal operation, see [Relay test](#relay-test) |
 | `BREW_TEMP_C` | 95 °C | Brew temperature |
 | `STEAM_TEMP_C` | 140 °C | Steam temperature |
 | `OVER_TEMP_C` | 165 °C | Safety cut-out |
 | `GRIND_MS` | 12 s | Grind time for one dose |
 | `PREINFUSE_MS` / `SOAK_MS` / `BREW_MS` | 3 s / 2 s / 25 s | Brew stages |
 | `HOT_WATER_MS` | 30 s | Maximum hot water run |
+| `HEATER_KP` / `HEATER_KI` / `HEATER_KD` | 0.08 / 0.002 / 0.2 | PID gains, see [Heater control](#heater-control) |
+| `HEATER_STEP_MS` | 20 ms | One mains cycle: 20 for 50 Hz, 17 for 60 Hz |
 | `HEAT_TIMEOUT_MS` | 5 min | Fault if not at temperature by then |
 | `IDLE_MS` / `STEAM_IDLE_MS` | 30 min / 3 min | Auto standby / leave steam mode |
 | `RING_COUNT` | 16 | Number of LEDs in the lamp ring |
