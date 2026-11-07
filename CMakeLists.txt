@@ -60,7 +60,11 @@ target_link_libraries(PicoCoffeeZanussi
         hardware_spi
         hardware_i2c
         hardware_pio
-        pico_cyw43_arch_none
+        hardware_flash
+        pico_flash
+        pico_cyw43_arch_lwip_poll   # Wi-Fi, polled from the main loop
+        pico_lwip_mdns
+        pico_lwip_mqtt              # Home Assistant
         )
 
 pico_add_extra_outputs(PicoCoffeeZanussi)

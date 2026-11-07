@@ -17,12 +17,14 @@ Replacement controller for a **Zanussi ZCOF637X** espresso machine, built on a R
 - Status shown on a strip of 7 WS2812 (NeoPixel) LEDs, a 128x64 OLED, or both.
 - A 16-LED NeoPixel ring in place of the original halogen lamp.
 - Serial log of every button press, state change and fault.
+- Home Assistant integration over MQTT, with remote start and standby.
+- Web page over Wi-Fi with live status, a 15-minute temperature graph, and the settings (PID gains, temperatures, times), which are kept in flash.
 
 ## Hardware
 
 | Part | Notes |
 |---|---|
-| Raspberry Pi Pico 2 W (RP2350) | The original Pico (RP2040) also works if you change `PICO_BOARD` in `CMakeLists.txt` |
+| Raspberry Pi Pico 2 W (RP2350) | A Pico W (RP2040) also works if you set `PICO_BOARD` to `pico_w` in `CMakeLists.txt`. The web interface needs the W's Wi-Fi |
 | MAX6675 module + K-type thermocouple | Mounted on the boiler/thermoblock |
 | 16-LED WS2812B ring | Replaces the halogen lamp. First in the LED chain |
 | 7 x WS2812B LEDs (NeoPixel strip or individual pixels) | Status display, chained after the ring. Optional if you fit the OLED |
@@ -71,9 +73,11 @@ Power: the Pico sits on a carrier PCB with a 5 V rail, fed by a 5 V 5 A DC suppl
 | Button | Short press | Hold 2 s |
 |---|---|---|
 | **Grind** | Grind one dose (press again to stop early) | |
-| **Coffee** | Start a shot (press again to stop) | Switch to standby from any state |
+| **Coffee** | Start a shot (press again to stop). Acts when you let go | Switch to standby from any state, without starting the pump |
 | **Water** | Hot water through the wand (press again to stop) | |
 | **Steam** | Heat for steam; press again to leave steam mode | |
+
+Coffee acts when you let go of it, not when you press it, so that a 2 s hold for standby can't start a shot first. The other buttons act as soon as you press them.
 
 Any button wakes the machine from standby. It heats to brew temperature and shows **READY** when it's there. For steam, wait for **STEAM RDY**, then open the steam knob. When you leave steam mode the machine shows **COOL DOWN** until it's back to brew temperature. Pressing Water during cool-down flushes water through the wand to speed this up.
 
@@ -81,14 +85,14 @@ The display shows the state, the current and target temperature, a countdown for
 
 ### Relay test
 
-While `RELAY_TEST_MODE` is `true` at the top of `PicoCoffeeZanussi.cpp`, the firmware runs a relay test instead of the normal state machine. Each relay is on only while you hold its button:
+Set `RELAY_TEST_MODE` to `true` at the top of `PicoCoffeeZanussi.cpp` to test the relays from the [web page](#web-interface). The state machine doesn't run, the buttons do nothing, and the heater stays off.
 
-| Hold | Relay |
-|---|---|
-| **Steam** | Group solenoid |
-| **Water** | Pump |
+The page shows a **Relay test** card with an on/off button for the pump, group solenoid and grinder. For safety:
 
-The heater and grinder stay off. The OLED and status LEDs show which relays are on: LED 1 is cyan for the pump and LED 2 is white for the solenoid. The other status LEDs glow dim magenta to show you're in test mode. The relay coils run from the 5 V rail, so the PSU must be on.
+- Each relay switches itself off after 30 s (`RELAY_TEST_MAX_ON_MS`). Pressing its button again restarts the 30 s.
+- All relays switch off within 3 s (`RELAY_TEST_PAGE_MS`) of the page going away: closing the tab, losing Wi-Fi, or the browser pausing a background tab.
+
+The OLED shows each relay's state and time left. On the status LEDs, LED 1 is cyan for the pump, LED 2 is white for the solenoid, and LED 3 is yellow for the grinder. The other status LEDs glow dim magenta to show you're in test mode. The relay coils run from the 5 V rail, so the PSU must be on.
 
 Before running the pump, fill the water tank and put a cup under the group head. With the solenoid closed the pump feeds the steam wand, so open the steam knob and hold a jug under it too.
 
@@ -96,11 +100,11 @@ Set `RELAY_TEST_MODE` to `false` and rebuild to use the machine normally.
 
 ### Status LEDs
 
-The colour shows the state. On a progress bar, the number of lit LEDs shows how far along it is, and the leading LED pulses.
+The first six status LEDs form a bar: the colour shows the state, and on a progress bar the number of lit LEDs shows how far along it is, with the leading LED pulsing. The last LED is a power indicator.
 
 | State | Colour | Pattern |
 |---|---|---|
-| Standby | Dim white | Whole strip breathes slowly |
+| Standby | | Off |
 | Heating | Orange | Bar fills as the temperature rises from 20 °C to brew temperature |
 | Ready | Green | All on |
 | Grinding | Yellow | Bar empties as the grind time runs out |
@@ -112,6 +116,16 @@ The colour shows the state. On a progress bar, the number of lit LEDs shows how 
 | Fault | Red | Flashing. 1 LED: thermocouple, 2 LEDs: over-temperature, 3 LEDs: heat timeout |
 
 Bars fill from the status LED nearest the ring.
+
+The power LED, the last on the strip, shows whether the machine is on and up to temperature:
+
+| State | Power LED |
+|---|---|
+| Standby | Breathes red |
+| Heating, Steam Heat | Red, through orange and yellow, to green as the temperature rises from cold to the target. For steam the whole range runs up to steam temperature, so at brew temperature it's yellow-green and turns fully green at steam temperature |
+| Cool Down | Red to green as the block cools back to brew temperature |
+| Ready, Grinding, brewing, Hot Water, Steam Ready | Green |
+| Fault | Flashes red, in step with the fault flash on the bar |
 
 The ring lights warm white whenever the machine is on, and goes off in standby.
 
@@ -151,7 +165,7 @@ These transitions are left out of the diagram:
 
 ### How the code is organised
 
-Everything is in [`PicoCoffeeZanussi.cpp`](PicoCoffeeZanussi.cpp):
+The firmware is in [`PicoCoffeeZanussi.cpp`](PicoCoffeeZanussi.cpp), with the web page in [`web_page.h`](web_page.h):
 
 - **`STATES` table:** one row per state. It sets the heater target, which relays are on, the state's timer and idle timeout, and the hint shown on the display. To change what a state does, edit its row.
 - **`collect_events()`:** turns button presses, timers, temperature readings and fault conditions into events, with safety events first.
@@ -159,6 +173,8 @@ Everything is in [`PicoCoffeeZanussi.cpp`](PicoCoffeeZanussi.cpp):
 - **`LED_STYLES` table:** the colour and pattern for each state on the status LEDs.
 - **`update_heater()`:** the PID controller. It sets the heater power toward the current state's target, and sets zero power whenever the temperature reading is invalid.
 - **`heater_step()`:** the delta-sigma output, run from a timer interrupt once per mains cycle.
+- **`DEFAULT_SETTINGS` and `SETTING_FIELDS`:** the settings that can be changed from the web page, with their defaults and allowed ranges. To add a setting, add it to `Settings`, `DEFAULT_SETTINGS` and `SETTING_FIELDS`, and the web page shows it automatically.
+- **`http_handle()`:** the web server's routes.
 
 ## Heater control
 
@@ -174,11 +190,125 @@ The SSR is switched from 5 V through a Darlington array (ULN2003 or similar), so
 
 ### Tuning
 
-The default gains are starting points. Tune them with the machine cold, filled with water, and the serial log open. Each status line shows the power, the P and I terms, and the rate of temperature change.
+The default gains are starting points. Tune them on the [web page](#web-interface), which shows the temperature graph and the P and I terms live, with the machine cold and filled with water. Changes take effect straight away. The serial log shows the same values every 2 s.
 
-1. Set `HEATER_KI` and `HEATER_KD` to 0. Raise `HEATER_KP` until the temperature settles near the target without oscillating. It will settle a little below the target.
-2. Raise `HEATER_KD` to cut the overshoot when heating from cold. Thermoblocks overshoot because the thermocouple lags the heater.
-3. Raise `HEATER_KI` until the temperature settles on the target within a minute or two. Too much makes it oscillate slowly.
+1. Set Ki and Kd to 0. Raise Kp until the temperature settles near the target without oscillating. It will settle a little below the target.
+2. Raise Kd to cut the overshoot when heating from cold. Thermoblocks overshoot because the thermocouple lags the heater.
+3. Raise Ki until the temperature settles on the target within a minute or two. Too much makes it oscillate slowly.
+
+## Web interface
+
+The Pico 2 W joins your Wi-Fi network and serves a web page with:
+
+- **Status:** state, temperature, target, heater power, time left in a timed step, which outputs are on, and the PID terms. It updates every second.
+- **Temperature graph:** the last 15 minutes of temperature, target and heater power. The controller keeps the history, so the graph is full as soon as you open the page.
+- **Settings:** brew and steam temperatures, PID gains, and the grind, pre-infuse, soak, extract and hot-water times. **Save** applies them at once and stores them in flash, so they survive a power cut. **Restore defaults** goes back to the values in `DEFAULT_SETTINGS`.
+
+The safety limits (`OVER_TEMP_C`, `HEAT_TIMEOUT_MS`) stay fixed in the firmware, and every setting is range-checked. For example, steam temperature can't go above 150 °C.
+
+### Setting up
+
+1. Copy [`wifi_config.example.h`](wifi_config.example.h) to `wifi_config.h` and fill in your network name and password. `wifi_config.h` is in `.gitignore`, so your password stays out of the repository.
+2. Rebuild. The build only notices a newly created `wifi_config.h` when `PicoCoffeeZanussi.cpp` is recompiled, so save that file once, or clean the build.
+3. Watch the serial log for the address:
+   ```
+   [  3.512] Wi-Fi: connected, http://192.168.1.42/ or http://zanussi.local/
+   ```
+4. Open either address in a browser on the same network.
+
+Without `wifi_config.h` the firmware builds and runs as before, with the web interface left out. The firmware reconnects by itself if the network drops.
+
+> [!WARNING]
+> The page has no password, so anyone on your network can change the settings. Keep the machine on a home network you trust, never on a public or guest one, and don't expose it to the internet.
+
+### API
+
+The page uses a small JSON API, which you can also call yourself:
+
+| Request | Returns |
+|---|---|
+| `GET /api/status` | Current state, temperature, target, power, PID terms, outputs, Wi-Fi signal and uptime |
+| `GET /api/history` | The last 15 minutes, one point a second: `temp` (°C or `null`), `target` (°C or `null` when the heater is off) and `power` (%) |
+| `GET /api/settings` | Current `values`, `defaults`, and the `fields` with their labels, units and limits |
+| `POST /api/settings` | Changes settings. Form-encoded body, for example `brew_temp_c=93&kp=0.1`. Settings left out stay as they are, and nothing changes if any value is out of range |
+| `POST /api/settings/reset` | Restores the defaults |
+| `POST /api/relay` | [Relay test mode](#relay-test) only: switches a relay, for example `relay=pump&on=1`. `relay` is `pump`, `valve` or `grinder` |
+
+Times are in seconds in the API.
+
+## Home Assistant
+
+The machine can join Home Assistant through MQTT. It uses MQTT discovery, so it appears as a **Coffee Machine** device with no YAML to write.
+
+### Setting up
+
+1. Install an MQTT broker, for example the **Mosquitto broker** add-on, and the **MQTT** integration in Home Assistant.
+2. Add the broker to `wifi_config.h`, using the broker's IP address. `.local` names don't resolve on the Pico:
+   ```c
+   #define MQTT_HOST     "192.168.1.10"
+   #define MQTT_BROKER_PORT 1883         // optional, 1883 is the default
+   #define MQTT_USER     "mqtt-user"     // leave out if the broker needs no login
+   #define MQTT_PASSWORD "mqtt-password"
+   ```
+3. Save `PicoCoffeeZanussi.cpp` so it's recompiled, then build and flash.
+4. The serial log shows `MQTT: connected to ...`. The device then appears under **Settings → Devices & services → MQTT**.
+
+Leave `MQTT_HOST` out to build without MQTT.
+
+### What appears in Home Assistant
+
+| Entity | Type | Notes |
+|---|---|---|
+| Power | Switch | On starts heating from standby. Off goes to standby |
+| State | Sensor | `STANDBY`, `HEATING`, `READY`, `BREWING` and so on |
+| Temperature, Target temperature | Sensors | °C |
+| Heater power | Sensor | % |
+| Time left | Sensor | Seconds left in a timed step |
+| Fault | Sensor | `none`, `THERMOCOUPLE`, `OVER TEMPERATURE` or `HEAT TIMEOUT` |
+| Wi-Fi signal | Sensor (diagnostic) | dBm |
+| Pump, Group solenoid, Grinder, Heating | Binary sensors | |
+| Every [setting](#configuration) | Numbers (configuration) | Same limits as the web page. Changes are saved to flash |
+
+The machine also publishes "offline" through the broker if it loses power or Wi-Fi, so its entities show as unavailable.
+
+### Remote start rules
+
+- **Remote start** only wakes the machine from standby. It heats to brew temperature, exactly as if you'd pressed a button.
+- **A fault can't be cleared remotely.** If the machine is in Fault, remote start is refused and logged. You have to press a button on the machine once the fault has cleared.
+- **Remote standby** works from any state except Fault, the same as holding Coffee for 2 s.
+- **Unchanged safety:** the heat timeout, the 30-minute idle standby and the over-temperature cut-out all still apply. A remote start counts as activity, so the machine goes back to standby 30 minutes later unless you use it.
+- **Relay test mode** ignores remote commands.
+
+For example, this automation heats the machine every weekday morning:
+
+```yaml
+automation:
+  - alias: "Warm up the coffee machine"
+    triggers:
+      - trigger: time
+        at: "06:45:00"
+    conditions:
+      - condition: time
+        weekday: [mon, tue, wed, thu, fri]
+    actions:
+      - action: switch.turn_on
+        target:
+          entity_id: switch.coffee_machine_power
+```
+
+### Topics
+
+| Topic | Direction | Payload |
+|---|---|---|
+| `zanussi/state` | Published, retained | JSON: `state`, `temp`, `target`, `power`, `time_left`, `fault`, `pump`, `valve`, `grinder`, `heating`, `on`, `rssi`. Sent on change (at most once a second) and every 30 s |
+| `zanussi/settings` | Published, retained | JSON with every setting, in the web page's units |
+| `zanussi/availability` | Published, retained | `online` or `offline` |
+| `zanussi/power/set` | Subscribed | `ON` or `OFF` |
+| `zanussi/settings/<key>/set` | Subscribed | A number, for example `zanussi/settings/brew_temp_c/set` with `93` |
+| `homeassistant/<type>/zanussi/<id>/config` | Published, retained | Discovery messages. Sent again whenever Home Assistant restarts |
+
+> [!WARNING]
+> Anyone who can publish to your broker can start the machine. Give the broker a username and password, and don't expose it to the internet.
 
 ## Building and flashing
 
@@ -206,18 +336,23 @@ Logging goes to both UART0 (GP0/GP1, 115200 baud) and USB. With a Debug Probe, o
 
 ## Configuration
 
-All settings are constants at the top of `PicoCoffeeZanussi.cpp`.
+The temperatures, PID gains and step times are settings: change them on the [web page](#web-interface), or change their defaults in `DEFAULT_SETTINGS`.
+
+| Setting | Default | Allowed |
+|---|---|---|
+| Brew temperature | 95 °C | 85-100 °C |
+| Steam temperature | 140 °C | 110-150 °C |
+| Kp / Ki / Kd | 0.08 / 0.002 / 0.2 | 0-1 / 0-0.05 / 0-5, see [Heater control](#heater-control) |
+| Grind | 12 s | 1-60 s |
+| Pre-infuse / Soak / Extract | 3 s / 2 s / 25 s | 1-10 s / 1-20 s / 5-60 s |
+| Hot water | 30 s | 5-120 s |
+
+Everything else is a constant at the top of `PicoCoffeeZanussi.cpp`.
 
 | Constant | Default | Purpose |
 |---|---|---|
-| `RELAY_TEST_MODE` | `true` | Temporary relay test instead of normal operation, see [Relay test](#relay-test) |
-| `BREW_TEMP_C` | 95 °C | Brew temperature |
-| `STEAM_TEMP_C` | 140 °C | Steam temperature |
+| `RELAY_TEST_MODE` | `false` | Relay test from the web page instead of normal operation, see [Relay test](#relay-test) |
 | `OVER_TEMP_C` | 165 °C | Safety cut-out |
-| `GRIND_MS` | 12 s | Grind time for one dose |
-| `PREINFUSE_MS` / `SOAK_MS` / `BREW_MS` | 3 s / 2 s / 25 s | Brew stages |
-| `HOT_WATER_MS` | 30 s | Maximum hot water run |
-| `HEATER_KP` / `HEATER_KI` / `HEATER_KD` | 0.08 / 0.002 / 0.2 | PID gains, see [Heater control](#heater-control) |
 | `HEATER_STEP_MS` | 20 ms | One mains cycle: 20 for 50 Hz, 17 for 60 Hz |
 | `HEAT_TIMEOUT_MS` | 5 min | Fault if not at temperature by then |
 | `IDLE_MS` / `STEAM_IDLE_MS` | 30 min / 3 min | Auto standby / leave steam mode |
@@ -245,6 +380,11 @@ The firmware assumes the group solenoid opens the path to the group head only wh
 | `I2C scan: no devices` | Check SDA/SCL wiring and the OLED's power |
 | `FAULT: THERMOCOUPLE` | Thermocouple open circuit, or the MAX6675 isn't wired or powered |
 | `FAULT: HEAT TIMEOUT` | Heater relay or heater not working, or the thermocouple isn't attached to the block |
+| `Web interface off: no wifi_config.h` | Create `wifi_config.h`, then save `PicoCoffeeZanussi.cpp` so it's recompiled |
+| `Wi-Fi: wrong password` / `network ... not found` | Check `wifi_config.h`. The Pico 2 W only uses 2.4 GHz networks |
+| `MQTT: connection to ... failed (5)` | Wrong `MQTT_USER` or `MQTT_PASSWORD` |
+| `MQTT: can't find broker` or no `MQTT: connected` | Check `MQTT_HOST` is the broker's IP address and the broker is running |
+| `zanussi.local` doesn't open | Some networks and older Android phones don't support mDNS names. Use the IP address from the serial log |
 
 ## License
 

@@ -1,4 +1,5 @@
 build
+wifi_config.h
 !.vscode/*
 ~$*
 *.sldprt
