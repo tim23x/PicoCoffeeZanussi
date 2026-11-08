@@ -59,7 +59,7 @@ input:invalid { border-color: var(--bad); }
 button { font: inherit; padding: 7px 16px; border-radius: 6px; border: 1px solid var(--accent); cursor: pointer;
   background: var(--accent); color: #fff; }
 button.secondary { background: transparent; color: var(--text); border-color: var(--line); }
-#msg { font-size: 13px; color: var(--muted); }
+#msg, #soundmsg { font-size: 13px; color: var(--muted); }
 #relaytest { display: none; border-color: var(--warn); }
 #relaytest p { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
 .relays { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -107,6 +107,12 @@ button.secondary { background: transparent; color: var(--text); border-color: va
   </section>
 
   <section class="card">
+    <h2>Sound</h2>
+    <div class="relays" id="tunes"></div>
+    <div class="actions"><span id="soundmsg"></span></div>
+  </section>
+
+  <section class="card">
     <h2>Settings</h2>
     <form id="settings"></form>
     <div class="actions">
@@ -132,7 +138,7 @@ async function getJSON(url, opts) {
 function fmt(v, unit, dp = 1) { return v == null ? '–' : v.toFixed(dp) + unit; }
 
 function showStatus(s) {
-  $('state').textContent = s.state;
+  $('state').textContent = s.state + (s.long_coffee ? ' · long coffee' : '');
   $('fault').style.display = s.fault ? 'block' : 'none';
   $('fault').textContent = 'Fault: ' + s.fault;
   $('temp').textContent = s.temp_valid ? fmt(s.temp, ' °C') : 'no reading';
@@ -243,10 +249,25 @@ function draw() {
   line(hist.temp, col('--temp'), 2, []);
 }
 
+async function loadHistory() {
+  try {
+    const h = await getJSON('/api/history');
+    hist = { temp: h.temp, target: h.target, power: h.power };
+  } catch (e) {}
+}
+
+// The graph has one point a second. Polls can be missed: browsers poll a background tab only
+// about once a minute, and the controller may have restarted. Then reload its own history.
+let lastUptime = null;
 async function poll() {
   try {
     const s = await getJSON('/api/status');
-    showStatus(s); push(s); draw();
+    showStatus(s);
+    const gap = lastUptime == null ? 0 : s.uptime - lastUptime;
+    lastUptime = s.uptime;
+    if (gap < 0 || gap > 2) await loadHistory();
+    else for (let i = 0; i < gap; i++) push(s);
+    draw();
   } catch (e) {
     $('conn').innerHTML = '<b class="off">Offline</b>';
   }
@@ -290,18 +311,34 @@ async function reset() {
   } catch (e) { message(e.message, true); }
 }
 
+// One button per tune. Plays at the volume saved in the settings.
+function showSound(s) {
+  $('soundmsg').textContent = !s.ok ? 'No sound: the I2S output did not start' :
+    (s.date ? `Date ${s.date}` : 'Date not known yet (needs network time)') + ' · plays at the saved volume';
+  const box = $('tunes');
+  if (box.children.length) return;
+  for (const key of s.tunes) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = key.replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
+    b.onclick = async () => {
+      try { showSound(await getJSON('/api/sound', { method: 'POST', body: new URLSearchParams({ tune: key }) })); }
+      catch (e) { $('soundmsg').textContent = e.message; }
+    };
+    box.appendChild(b);
+  }
+}
+
 $('save').onclick = save;
 $('reset').onclick = reset;
 window.addEventListener('resize', draw);
 
 (async () => {
-  try {
-    const h = await getJSON('/api/history');
-    hist = { temp: h.temp, target: h.target, power: h.power };
-  } catch (e) {}
+  await loadHistory();
   draw();
   poll();
   try { buildForm(await getJSON('/api/settings')); } catch (e) { message('Could not load settings', true); }
+  try { showSound(await getJSON('/api/sound')); } catch (e) {}
 })();
 </script>
 </body>

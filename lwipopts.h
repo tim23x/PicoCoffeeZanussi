@@ -44,7 +44,16 @@
 #define LWIP_NETIF_EXT_STATUS_CALLBACK  1
 #define MDNS_MAX_SERVICES               1
 #define MEMP_NUM_UDP_PCB                6
-#define MEMP_NUM_SYS_TIMEOUT            (LWIP_NUM_SYS_TIMEOUT_INTERNAL + 6)
+#define MEMP_NUM_SYS_TIMEOUT            (LWIP_NUM_SYS_TIMEOUT_INTERNAL + 7)
+
+// SNTP for the date (seasonal tunes). clock_set_unix() is in PicoCoffeeZanussi.cpp.
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C"
+#endif
+void clock_set_unix(uint32_t unix_s);
+#define SNTP_SERVER_DNS                 1
+#define SNTP_SET_SYSTEM_TIME(sec)       clock_set_unix(sec)
 
 // MQTT for Home Assistant: discovery messages are up to ~500 bytes each
 #define MQTT_OUTPUT_RINGBUF_SIZE        2048

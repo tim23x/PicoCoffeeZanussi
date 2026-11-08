@@ -5,8 +5,9 @@
 // and a WS2812 chain (PIO): a lamp ring, then the status LEDs. Either the OLED or the
 // status LEDs can be left out. With wifi_config.h present, a web page on the Pico 2 W's Wi-Fi
 // shows the status and a temperature graph, and changes the settings (kept in flash). With
-// MQTT_HOST set as well, the machine appears in Home Assistant through MQTT discovery.
-// Logging goes to stdio: UART0 (GP0 TX, GP1 RX, 115200) for the Debug Probe, and USB.
+// MQTT_HOST set as well, the machine appears in Home Assistant through MQTT discovery. A
+// MAX98357A I2S amplifier (PIO + DMA) plays a chime when the machine is ready and an alarm at
+// a fault. Logging goes to stdio: UART0 (GP0 TX, GP1 RX, 115200) for the Debug Probe, and USB.
 
 #include <math.h>
 #include <stdarg.h>
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include "pico/stdlib.h"
 #include "pico/flash.h"
 #include "pico/cyw43_arch.h"
@@ -22,11 +24,15 @@
 #include "hardware/i2c.h"
 #include "hardware/pio.h"
 #include "hardware/flash.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
 #include "lwip/tcp.h"
 #include "lwip/dns.h"
 #include "lwip/apps/mdns.h"
 #include "lwip/apps/mqtt.h"
+#include "lwip/apps/sntp.h"
 #include "ws2812.pio.h"
+#include "audio_i2s.pio.h"
 
 #if __has_include("wifi_config.h")
 #include "wifi_config.h"  // WIFI_SSID and WIFI_PASSWORD, see wifi_config.example.h
@@ -93,6 +99,7 @@ constexpr uint32_t IDLE_MS = 30 * 60 * 1000;
 
 constexpr uint32_t DEBOUNCE_MS = 30;
 constexpr uint32_t LONG_PRESS_MS = 2000;  // hold COFFEE to switch off
+constexpr uint32_t DOUBLE_PRESS_MS = 600; // a second COFFEE press this soon after starting: long coffee
 constexpr uint32_t SENSOR_PERIOD_MS = 250; // MAX6675 needs >= 220 ms per conversion
 constexpr int SENSOR_FAULT_COUNT = 3;
 constexpr uint32_t DISPLAY_PERIOD_MS = 250;
@@ -117,6 +124,8 @@ struct Settings {
     uint32_t soak_ms;
     uint32_t brew_ms;
     uint32_t hot_water_ms;
+    float volume;  // %, 0 = silent. New settings go at the end, see settings_load()
+    uint32_t long_brew_ms;  // extract time for a long coffee (double press)
 };
 
 // Used until settings are saved, and whenever the saved copy is invalid. The PID gains are
@@ -132,6 +141,8 @@ static constexpr Settings DEFAULT_SETTINGS = {
     2 * 1000,   // soak_ms
     25 * 1000,  // brew_ms
     30 * 1000,  // hot_water_ms
+    30.0f,      // volume
+    45 * 1000,  // long_brew_ms
 };
 
 static Settings cfg = DEFAULT_SETTINGS;
@@ -359,7 +370,7 @@ enum class State {
 
 enum class Event {
     SensorFailed, OverTemp,
-    GrindPressed, CoffeePressed, WaterPressed, SteamPressed, CoffeeHeld,
+    GrindPressed, CoffeePressed, WaterPressed, SteamPressed, CoffeeHeld, CoffeeDouble,
     TimerExpired, AtTemp, TooCold, CooledDown, Idle,
     RemoteStart, RemoteStandby,  // from Home Assistant
 };
@@ -407,6 +418,7 @@ static const char* event_name(Event e) {
         case Event::WaterPressed:  return "WATER pressed";
         case Event::SteamPressed:  return "STEAM pressed";
         case Event::CoffeeHeld:    return "COFFEE held";
+        case Event::CoffeeDouble:  return "COFFEE pressed twice";
         case Event::TimerExpired:  return "timer expired";
         case Event::AtTemp:        return "at temperature";
         case Event::TooCold:       return "too cold";
@@ -436,7 +448,15 @@ struct Machine {
     float temp_c = 0.0f;
     bool temp_valid = false;
     int sensor_errors = 0;
+    bool long_shot = false;  // this shot is a long coffee
 };
+
+static uint32_t extract_ms(const Machine& m) { return m.long_shot ? cfg.long_brew_ms : cfg.brew_ms; }
+
+// The current state's timer: a long coffee extracts for longer than the table's brew time.
+static uint32_t state_timer_ms(const Machine& m) {
+    return m.state == State::Brewing ? extract_ms(m) : timer_ms(info(m.state));
+}
 
 static bool fault_cleared(const Machine& m) {
     return m.temp_valid && m.sensor_errors == 0 && m.temp_c < OVER_TEMP_C;
@@ -535,6 +555,7 @@ static void enter_state(Machine& m, State next, Event cause, uint32_t now) {
         LOG("Fault cleared");
     }
     LOG("%s -> %s (%s, %.2f C)", info(m.state).name, info(next).name, event_name(cause), m.temp_c);
+    if (next != State::Soak && next != State::Brewing) m.long_shot = false;  // each shot starts as an espresso
     m.state = next;
     m.entered_ms = now;
     m.activity_ms = now;
@@ -555,12 +576,14 @@ static int collect_events(const Machine& m, const ButtonEvents& b, uint32_t now,
     if (m.temp_valid && m.temp_c >= OVER_TEMP_C)    out[n++] = Event::OverTemp;
     if (b.held[BTN_COFFEE])                          out[n++] = Event::CoffeeHeld;
     if (b.pressed[BTN_GRIND])                        out[n++] = Event::GrindPressed;
-    if (b.pressed[BTN_COFFEE])                       out[n++] = Event::CoffeePressed;
+    // A second COFFEE press just after a shot starts makes it a long coffee instead of stopping it.
+    bool second_press = m.state == State::Preinfuse && !m.long_shot && in_state < DOUBLE_PRESS_MS;
+    if (b.pressed[BTN_COFFEE])                       out[n++] = second_press ? Event::CoffeeDouble : Event::CoffeePressed;
     if (b.pressed[BTN_WATER])                        out[n++] = Event::WaterPressed;
     if (b.pressed[BTN_STEAM])                        out[n++] = Event::SteamPressed;
     if (remote_command == RemoteCommand::Start)      out[n++] = Event::RemoteStart;
     if (remote_command == RemoteCommand::Standby)    out[n++] = Event::RemoteStandby;
-    uint32_t timer = timer_ms(si);
+    uint32_t timer = state_timer_ms(m);
     float target = target_c(si);
     if (timer && in_state >= timer)                  out[n++] = Event::TimerExpired;
     if (m.temp_valid) {
@@ -581,6 +604,11 @@ static void run_state_machine(Machine& m, const ButtonEvents& b, uint32_t now) {
     int n = collect_events(m, b, now, events);
     remote_command = RemoteCommand::None;
     for (int i = 0; i < n; ++i) {
+        if (events[i] == Event::CoffeeDouble) {  // changes the shot, not the state
+            m.long_shot = true;
+            LOG("Long coffee: extract %.0f s", cfg.long_brew_ms / 1000.0f);
+            return;
+        }
         State next = next_state(m, events[i]);
         if (next != m.state) {
             enter_state(m, next, events[i], now);
@@ -682,7 +710,7 @@ static void drive_relays(const Machine& m) {
 static uint32_t time_left_ms(const Machine& m, uint32_t now) {
     const StateInfo& si = info(m.state);
     if (si.timer_ms == &HEAT_TIMEOUT_MS) return 0;
-    uint32_t timer = timer_ms(si);
+    uint32_t timer = state_timer_ms(m);
     uint32_t in_state = now - m.entered_ms;
     return in_state < timer ? timer - in_state : 0;
 }
@@ -708,6 +736,9 @@ static void render(const Machine& m, uint32_t now) {
     } else if (uint32_t left = time_left_ms(m, now)) {
         snprintf(line, sizeof(line), "TIME %2lu S", (unsigned long)((left + 999) / 1000));
         draw_text(0, 5, line);
+    }
+    if (m.state == State::Preinfuse || m.state == State::Soak || m.state == State::Brewing) {
+        draw_text(0, 6, m.long_shot ? "LONG COFFEE" : "ESPRESSO");
     }
 
     draw_text(0, 7, si.hint);
@@ -808,14 +839,14 @@ static void leds_render(const Machine& m, uint32_t now) {
             }
             break;
         case LedPattern::Countdown:
-            fill = 1.0f - (float)in_state / timer_ms(si);
+            fill = 1.0f - (float)in_state / state_timer_ms(m);
             break;
         case LedPattern::Shot: {
             // Earlier stages always ran their full time, or we'd have gone back to Ready.
             uint32_t done = in_state;
             if (m.state != State::Preinfuse) done += cfg.preinfuse_ms;
             if (m.state == State::Brewing) done += cfg.soak_ms;
-            fill = (float)done / (cfg.preinfuse_ms + cfg.soak_ms + cfg.brew_ms);
+            fill = (float)done / (cfg.preinfuse_ms + cfg.soak_ms + extract_ms(m));
             break;
         }
         case LedPattern::Flash:
@@ -876,6 +907,277 @@ static void leds_test_render(uint32_t elapsed) {
             put_pixel(255, 255, 255, lit ? k : 0.0f);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sound: a MAX98357A I2S amplifier, fed by PIO and DMA. Tunes are RTTTL strings, played by a
+// small synthesiser in the DMA interrupt, so pauses in the main loop don't break them up.
+// ---------------------------------------------------------------------------
+
+constexpr uint I2S_DATA_PIN = 11;    // MAX98357A DIN
+constexpr uint I2S_CLOCK_PIN = 12;   // BCLK; LRCLK is on the next pin, GP13
+constexpr uint32_t AUDIO_RATE = 24000;
+constexpr int AUDIO_FRAMES = 256;    // per DMA buffer: 10.7 ms
+constexpr uint AUDIO_DMA_IRQ = 1;    // DMA_IRQ_1
+constexpr float NOTE_DECAY_S = 0.5f; // notes fade like a struck bell, with this time constant
+constexpr uint32_t NOTE_ATTACK = AUDIO_RATE / 500;     // 2 ms fade in and
+constexpr uint32_t NOTE_RELEASE = AUDIO_RATE / 100;    // 10 ms fade out, so notes don't click
+constexpr uint32_t CHIME_AFTER_MS = 10 * 1000;  // chime only after a real warm-up, not after every grind
+constexpr int UTC_OFFSET_MIN = 0;    // local time, for the seasonal tunes: 60 for CET, -300 for EST
+
+// RTTTL is name:defaults:notes. Each note is [duration]letter[#][.][octave], and p is a rest.
+struct Tune {
+    const char* key;
+    const char* rtttl;
+};
+static const Tune TUNES[] = {
+    {"ready",        "Ready:d=8,o=6,b=150:c,e,g,2c7"},
+    {"fault",        "Fault:d=16,o=6,b=150:a,f,a,f,a,f,a,f,4p,a,f,a,f,a,f,a,f,4p,a,f,a,f,a,f,a,f"},
+    {"jingle_bells", "Jingle Bells:d=4,o=5,b=200:e,e,2e,e,e,2e,e,g,c.,8d,1e,f,f,f,f,f,e,e,8e,8e,g,g,f,d,1c"},
+};
+
+// Played instead of the ready chime on the first warm-up of each day between these dates.
+struct SeasonalTune {
+    int month, first_day, last_day;
+    const char* tune;
+};
+static const SeasonalTune SEASONAL_TUNES[] = {
+    {12, 1, 31, "jingle_bells"},
+};
+
+// Wall clock, set by SNTP once the Wi-Fi is up (see lwipopts.h). Only the date is used.
+static uint32_t clock_unix_s = 0;  // 0 = not set yet
+static uint32_t clock_set_ms = 0;
+
+static bool local_date(tm* out) {
+    if (!clock_unix_s) return false;
+    time_t t = (time_t)clock_unix_s + (millis() - clock_set_ms) / 1000 + UTC_OFFSET_MIN * 60;
+    gmtime_r(&t, out);
+    return true;
+}
+
+extern "C" void clock_set_unix(uint32_t unix_s) {
+    bool first = !clock_unix_s;
+    clock_unix_s = unix_s;
+    clock_set_ms = millis();
+    tm d;
+    if (first && local_date(&d)) LOG("Clock set by SNTP: %04d-%02d-%02d", d.tm_year + 1900, d.tm_mon + 1, d.tm_mday);
+}
+
+struct Player {
+    const char* next = nullptr;  // the rest of the tune, nullptr = finished
+    int dur = 4, octave = 6, bpm = 63;  // the tune's defaults
+    uint32_t phase = 0, step = 0;  // step 0 = a rest
+    uint32_t left = 0, done = 0;   // samples left in, and played of, the current note
+    uint32_t release = 0;
+    float env = 0, gain = 0;
+};
+
+static PIO audio_pio;
+static uint audio_sm;
+static int audio_dma[2];
+static bool audio_ok = false;
+// Each buffer is 1 KB and 1 KB aligned, and the DMA read address wraps within it: no need to
+// reset it, and if the interrupt is held off the buffer just plays again.
+static uint32_t audio_buf[2][AUDIO_FRAMES] __attribute__((aligned(sizeof(uint32_t) * AUDIO_FRAMES)));
+static_assert(sizeof(audio_buf[0]) == 1 << 10, "the DMA read ring is set for 1 KB buffers");
+static float sine[256];
+static float note_decay;  // per sample
+static Player player;     // only touched in the interrupt
+static const char* volatile audio_request = nullptr;  // a tune for the interrupt to start
+static volatile bool audio_playing = false;
+
+static int parse_uint(const char*& p) {
+    int v = 0;
+    while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+    return v;
+}
+
+// Reads the "d=4,o=5,b=200" defaults; false if this isn't RTTTL.
+static bool tune_begin(Player& pl, const char* rtttl) {
+    const char* p = strchr(rtttl, ':');
+    if (!p) return false;
+    pl.dur = 4;
+    pl.octave = 6;
+    pl.bpm = 63;
+    for (++p; *p && *p != ':';) {
+        while (*p == ' ') ++p;
+        char key = *p;
+        if (key && p[1] == '=') {
+            p += 2;
+            int v = parse_uint(p);
+            if (v > 0 && key == 'd') pl.dur = v;
+            if (v > 0 && key == 'o') pl.octave = v;
+            if (v > 0 && key == 'b') pl.bpm = v;
+        }
+        while (*p && *p != ',' && *p != ':') ++p;
+        if (*p == ',') ++p;
+    }
+    if (*p != ':') return false;
+    pl.next = p + 1;
+    pl.left = 0;
+    return true;
+}
+
+// Starts the next note; false at the end of the tune.
+static bool tune_note(Player& pl) {
+    static const int8_t SEMITONES[] = {9, 11, 0, 2, 4, 5, 7, 11};  // a-g, and h for b
+    const char* p = pl.next;
+    while (*p == ',' || *p == ' ') ++p;
+    if (!*p) return false;
+    int dur = parse_uint(p);
+    if (dur <= 0) dur = pl.dur;
+    char c = *p | 0x20;  // lower case
+    int semitone = c >= 'a' && c <= 'h' ? SEMITONES[c - 'a'] : -1;  // anything else is a rest
+    if (*p) ++p;
+    if (*p == '#') {
+        if (semitone >= 0) ++semitone;
+        ++p;
+    }
+    float beats = 4.0f / dur;
+    if (*p == '.') {
+        beats *= 1.5f;
+        ++p;
+    }
+    int octave = parse_uint(p);
+    if (octave <= 0) octave = pl.octave;
+    octave = octave < 3 ? 3 : octave > 7 ? 7 : octave;  // keeps the overtones below the Nyquist limit
+    if (*p == '.') {
+        beats *= 1.5f;
+        ++p;
+    }
+    while (*p && *p != ',') ++p;
+    pl.next = p;
+
+    pl.left = (uint32_t)(beats * 60.0f / pl.bpm * AUDIO_RATE);
+    pl.done = 0;
+    pl.release = pl.left / 4 < NOTE_RELEASE ? pl.left / 4 : NOTE_RELEASE;
+    pl.phase = 0;
+    pl.step = 0;
+    pl.env = 1.0f;
+    float v = cfg.volume / 100.0f;
+    pl.gain = v * v * (32767.0f / 1.4f);  // square law sounds even; 1.4 is the waveform's peak
+    if (semitone >= 0) {
+        float hz = 440.0f * exp2f((semitone - 9) / 12.0f + (octave - 4));
+        pl.step = (uint32_t)(hz * (4294967296.0f / AUDIO_RATE));
+    }
+    return true;
+}
+
+static int16_t tune_sample(Player& pl) {
+    if (!pl.step) return 0;
+    uint32_t ph = pl.phase;
+    pl.phase += pl.step;
+    float wave = sine[ph >> 24] + 0.3f * sine[(ph * 2) >> 24] + 0.1f * sine[(ph * 3) >> 24];
+    float a = pl.env;
+    pl.env *= note_decay;
+    if (pl.done < NOTE_ATTACK) a *= (float)pl.done / NOTE_ATTACK;
+    if (pl.left < pl.release) a *= (float)pl.left / pl.release;
+    return (int16_t)(wave * a * pl.gain);
+}
+
+static void audio_fill(uint32_t* buf) {
+    Player& pl = player;
+    if (const char* t = audio_request) {
+        audio_request = nullptr;
+        if (!tune_begin(pl, t)) pl.next = nullptr;
+    }
+    for (int i = 0; i < AUDIO_FRAMES; ++i) {
+        while (!pl.left && pl.next) {
+            if (!tune_note(pl)) pl.next = nullptr;
+        }
+        int16_t s = 0;
+        if (pl.left) {
+            s = tune_sample(pl);
+            --pl.left;
+            ++pl.done;
+        }
+        buf[i] = (uint16_t)s * 0x10001u;  // the same sample left and right
+    }
+    audio_playing = pl.left || pl.next;
+}
+
+// Two DMA channels chained in a loop, each playing its own buffer; when one finishes, the other
+// starts and this refills the finished one.
+static void audio_dma_irq() {
+    for (int k = 0; k < 2; ++k) {
+        if (dma_irqn_get_channel_status(AUDIO_DMA_IRQ, audio_dma[k])) {
+            dma_irqn_acknowledge_channel(AUDIO_DMA_IRQ, audio_dma[k]);
+            audio_fill(audio_buf[k]);
+        }
+    }
+}
+
+static bool audio_init() {
+    uint offset;
+    if (!pio_claim_free_sm_and_add_program_for_gpio_range(&audio_i2s_program, &audio_pio, &audio_sm, &offset,
+                                                          I2S_DATA_PIN, 3, true)) {
+        return false;
+    }
+    for (int i = 0; i < 256; ++i) sine[i] = sinf(6.2831853f * i / 256);
+    note_decay = expf(-1.0f / (NOTE_DECAY_S * AUDIO_RATE));
+    audio_i2s_program_init(audio_pio, audio_sm, offset, I2S_DATA_PIN, I2S_CLOCK_PIN, AUDIO_RATE);
+
+    for (int& ch : audio_dma) ch = dma_claim_unused_channel(true);
+    for (int k = 0; k < 2; ++k) {
+        dma_channel_config c = dma_channel_get_default_config(audio_dma[k]);
+        channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+        channel_config_set_read_increment(&c, true);
+        channel_config_set_write_increment(&c, false);
+        channel_config_set_ring(&c, false, 10);  // read address wraps at 1 KB
+        channel_config_set_dreq(&c, pio_get_dreq(audio_pio, audio_sm, true));
+        channel_config_set_chain_to(&c, audio_dma[1 - k]);
+        dma_channel_configure(audio_dma[k], &c, &audio_pio->txf[audio_sm], audio_buf[k], AUDIO_FRAMES, false);
+        dma_irqn_set_channel_enabled(AUDIO_DMA_IRQ, audio_dma[k], true);
+    }
+    irq_add_shared_handler(DMA_IRQ_1, audio_dma_irq, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+    irq_set_enabled(DMA_IRQ_1, true);
+    pio_sm_set_enabled(audio_pio, audio_sm, true);
+    dma_channel_start(audio_dma[0]);
+    return true;
+}
+
+static const Tune* tune_find(const char* key) {
+    for (const Tune& t : TUNES) {
+        if (strcmp(t.key, key) == 0) return &t;
+    }
+    return nullptr;
+}
+
+// Starts a tune, cutting off whatever is playing.
+static bool sound_play(const char* key) {
+    const Tune* t = tune_find(key);
+    if (!t || !audio_ok) return false;
+    LOG("Sound: %s%s", t->key, cfg.volume > 0 ? "" : " (volume is 0)");
+    audio_request = t->rtttl;
+    return true;
+}
+
+// The seasonal tune on the first warm-up of the day it applies to; otherwise the chime.
+static const char* ready_tune() {
+    static int played_day = -1;
+    tm d;
+    if (!local_date(&d)) return "ready";
+    int day = d.tm_year * 1000 + d.tm_yday;
+    for (const SeasonalTune& s : SEASONAL_TUNES) {
+        if (d.tm_mon + 1 == s.month && d.tm_mday >= s.first_day && d.tm_mday <= s.last_day && day != played_day) {
+            played_day = day;
+            return s.tune;
+        }
+    }
+    return "ready";
+}
+
+// Called on every state change, with how long the machine spent in the old state.
+static void sound_on_state(State from, State to, uint32_t time_in_from) {
+    if (to == State::Fault) {
+        sound_play("fault");
+        return;
+    }
+    bool warmed_up = (from == State::Heating && to == State::Ready) ||
+                     (from == State::SteamHeat && to == State::SteamReady);
+    if (!warmed_up || time_in_from < CHIME_AFTER_MS) return;
+    sound_play(to == State::Ready ? ready_tune() : "ready");
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +1277,9 @@ static const SettingField SETTING_FIELDS[] = {
     FIELD(preinfuse_ms, "Times",        "Pre-infuse",        "s",       1,   10,    0.5f,    true),
     FIELD(soak_ms,      "Times",        "Soak",              "s",       1,   20,    0.5f,    true),
     FIELD(brew_ms,      "Times",        "Extract",           "s",       5,   60,    1,       true),
+    FIELD(long_brew_ms, "Times",        "Extract, long coffee", "s",    10,  120,   1,       true),
     FIELD(hot_water_ms, "Times",        "Hot water",         "s",       5,   120,   1,       true),
+    FIELD(volume,       "Sound",        "Volume",            "%",       0,   100,   1,       false),
 };
 #undef FIELD
 static_assert(OVER_TEMP_C > 150 + 10, "steam temperature limit must stay well below the cut-out");
@@ -1004,36 +1308,49 @@ static bool settings_valid(const Settings& s) {
 constexpr uint32_t SETTINGS_MAGIC = 0x5A434F46;  // "ZCOF"
 constexpr uint32_t SETTINGS_FLASH_OFFSET = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
 
+// The check follows the settings, so it sits at offsetof(StoredSettings, settings) + size.
 struct StoredSettings {
     uint32_t magic;
-    uint32_t size;  // sizeof(Settings), so a changed layout reads as invalid
+    uint32_t size;  // sizeof(Settings) when saved
     Settings settings;
     uint32_t check;
 };
 static_assert(sizeof(StoredSettings) <= FLASH_PAGE_SIZE, "settings must fit in one flash page");
+static_assert(sizeof(Settings) % 4 == 0, "the check must follow the settings with no padding");
 
-static uint32_t settings_check(const Settings& s) {
+static uint32_t settings_check(const void* s, size_t size) {
     uint32_t h = 2166136261u;  // FNV-1a
-    const uint8_t* p = (const uint8_t*)&s;
-    for (size_t i = 0; i < sizeof(s); ++i) h = (h ^ p[i]) * 16777619u;
+    const uint8_t* p = (const uint8_t*)s;
+    for (size_t i = 0; i < size; ++i) h = (h ^ p[i]) * 16777619u;
     return h;
 }
 
+// Settings saved by an older build are shorter: they keep their values, and the settings added
+// since take their defaults.
 static void settings_load() {
     const StoredSettings* stored = (const StoredSettings*)(XIP_BASE + SETTINGS_FLASH_OFFSET);
-    if (stored->magic == SETTINGS_MAGIC && stored->size == sizeof(Settings) &&
-        stored->check == settings_check(stored->settings) && settings_valid(stored->settings)) {
-        cfg = stored->settings;
-        LOG("Settings loaded from flash");
-    } else {
-        cfg = DEFAULT_SETTINGS;
-        LOG("No saved settings, using defaults");
+    uint32_t size = stored->size;
+    if (stored->magic == SETTINGS_MAGIC && size > 0 && size <= sizeof(Settings) && size % 4 == 0) {
+        uint32_t check;
+        memcpy(&check, (const uint8_t*)&stored->settings + size, sizeof(check));
+        Settings s = DEFAULT_SETTINGS;
+        memcpy(&s, &stored->settings, size);
+        if (check == settings_check(&stored->settings, size) && settings_valid(s)) {
+            cfg = s;
+            if (size == sizeof(Settings)) LOG("Settings loaded from flash");
+            else LOG("Settings loaded from flash; new settings take their defaults");
+            return;
+        }
     }
+    cfg = DEFAULT_SETTINGS;
+    LOG("No saved settings, using defaults");
 }
 
-// Runs with interrupts off, so the heater timer can't run: make sure the heater is off.
+// Runs with interrupts off, so the heater timer can't run: make sure the heater is off. The
+// sound DMA keeps repeating its buffers meanwhile, so silence them.
 static void settings_flash_write(void* page) {
     gpio_put(HEATER_PIN, 0);
+    memset(audio_buf, 0, sizeof(audio_buf));
     flash_range_erase(SETTINGS_FLASH_OFFSET, FLASH_SECTOR_SIZE);
     flash_range_program(SETTINGS_FLASH_OFFSET, (const uint8_t*)page, FLASH_PAGE_SIZE);
 }
@@ -1041,7 +1358,7 @@ static void settings_flash_write(void* page) {
 static void settings_save() {
     static uint8_t page[FLASH_PAGE_SIZE];
     memset(page, 0xFF, sizeof(page));
-    StoredSettings stored = {SETTINGS_MAGIC, sizeof(Settings), cfg, settings_check(cfg)};
+    StoredSettings stored = {SETTINGS_MAGIC, sizeof(Settings), cfg, settings_check(&cfg, sizeof(cfg))};
     memcpy(page, &stored, sizeof(stored));
     int rc = flash_safe_execute(settings_flash_write, page, 100);
     if (rc == PICO_OK) LOG("Settings saved to flash");
@@ -1216,6 +1533,7 @@ static void api_status(HttpConn* c) {
         valve = test_relays[1].on;
         grinder = test_relays[2].on;
     }
+    j.add("\"long_coffee\":%s,", m.long_shot ? "true" : "false");
     j.add("\"pump\":%s,\"valve\":%s,\"grinder\":%s,\"rssi\":%ld,\"uptime\":%lu,\"test_mode\":%s",
           pump ? "true" : "false", valve ? "true" : "false", grinder ? "true" : "false",
           (long)rssi, (unsigned long)(now / 1000), RELAY_TEST_MODE ? "true" : "false");
@@ -1339,6 +1657,25 @@ static void api_relay_post(HttpConn* c, char* body) {
     api_status(c);
 }
 
+static void api_sound(HttpConn* c) {
+    JsonOut j{c->buf, 0, HTTP_BODY_MAX};
+    j.add("{\"ok\":%s,\"playing\":%s,\"tunes\":[", audio_ok ? "true" : "false", audio_playing ? "true" : "false");
+    for (size_t i = 0; i < count_of(TUNES); ++i) j.add("%s\"%s\"", i ? "," : "", TUNES[i].key);
+    tm d;
+    if (local_date(&d)) j.add("],\"date\":\"%04d-%02d-%02d\"}", d.tm_year + 1900, d.tm_mon + 1, d.tm_mday);
+    else j.add("],\"date\":null}");
+    http_json(c, j);
+}
+
+// Body: tune=ready
+static void api_sound_post(HttpConn* c, char* body) {
+    const char* key = strncmp(body, "tune=", 5) == 0 ? body + 5 : "";
+    if (!audio_ok) return http_text(c, 409, "No sound: the I2S output didn't start");
+    if (!sound_play(key)) return http_text(c, 400, "Unknown tune");
+    audio_playing = true;  // until the interrupt says otherwise
+    api_sound(c);
+}
+
 static void http_handle(HttpConn* c, const char* method, char* path, char* body) {
     if (char* q = strchr(path, '?')) *q = 0;
     bool get = strcmp(method, "GET") == 0, post = strcmp(method, "POST") == 0;
@@ -1352,6 +1689,8 @@ static void http_handle(HttpConn* c, const char* method, char* path, char* body)
     if (strcmp(path, "/api/settings") == 0 && get) return api_settings(c);
     if (strcmp(path, "/api/settings") == 0 && post) return api_settings_post(c, body);
     if (strcmp(path, "/api/relay") == 0 && post) return api_relay_post(c, body);
+    if (strcmp(path, "/api/sound") == 0 && get) return api_sound(c);
+    if (strcmp(path, "/api/sound") == 0 && post) return api_sound_post(c, body);
     if (strcmp(path, "/api/settings/reset") == 0 && post) {
         cfg = DEFAULT_SETTINGS;
         settings_save_pending = true;
@@ -1484,6 +1823,11 @@ static void web_init(const Machine& m) {
     }
     listener = tcp_listen_with_backlog(listener, HTTP_MAX_CONNS);
     tcp_accept(listener, http_accept);
+
+    // The date, for the seasonal tunes. SNTP retries by itself until the network is up.
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
 
     web_up = true;
     wifi_connect();
@@ -1866,6 +2210,10 @@ int main() {
     leds_ok = leds_init();
     LOG("Lamp ring and status LEDs on GP%d %s", LED_PIN, leds_ok ? "OK" : "failed: no free PIO state machine");
 
+    audio_ok = audio_init();
+    LOG("Sound (I2S) on GP%d-%d %s, volume %.0f%%", I2S_DATA_PIN, I2S_CLOCK_PIN + 1,
+        audio_ok ? "OK" : "failed: no free PIO state machine", cfg.volume);
+
     static repeating_timer_t heater_timer;
     // Negative period: a fixed interval between starts, so the cycles don't drift.
     add_repeating_timer_ms(-(int32_t)HEATER_STEP_MS, heater_step, nullptr, &heater_timer);
@@ -1927,7 +2275,9 @@ int main() {
             relay_test_tick(now);
         } else {
             State before = m.state;
+            uint32_t before_ms = m.entered_ms;
             run_state_machine(m, b, now);
+            if (m.state != before) sound_on_state(before, m.state, now - before_ms);
             if (sampled || m.state != before) update_heater(m, sampled);
             drive_relays(m);
         }

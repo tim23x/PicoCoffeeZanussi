@@ -18,6 +18,7 @@ Replacement controller for a **Zanussi ZCOF637X** espresso machine, built on a R
 - A 16-LED NeoPixel ring in place of the original halogen lamp.
 - Serial log of every button press, state change and fault.
 - Home Assistant integration over MQTT, with remote start and standby.
+- Sound through an I2S amplifier: a chime when the machine is ready, an alarm at a fault, and seasonal tunes such as Jingle Bells in December.
 - Web page over Wi-Fi with live status, a 15-minute temperature graph, and the settings (PID gains, temperatures, times), which are kept in flash.
 
 ## Hardware
@@ -33,6 +34,7 @@ Replacement controller for a **Zanussi ZCOF637X** espresso machine, built on a R
 | Relay module, active-high | Grinder, group solenoid, pump. Must be rated for mains loads |
 | Carrier PCB with 5 V rail + 5 V 5 A DC supply | Powers the Pico, relay coils and LEDs |
 | 4 momentary push buttons | Grind, Coffee, Water, Steam |
+| MAX98357A I2S amplifier board + 4-8 Ω speaker (optional) | Sound. Up to 3 W from the 5 V rail |
 | Raspberry Pi Debug Probe (optional) | For flashing, debugging and the serial log |
 
 ## Wiring
@@ -57,6 +59,9 @@ All signals are 3.3 V. Physical pin numbers are for the Pico 2 W.
 | Coffee button | GP19 | 25 | Button to 3V3 |
 | Water button | GP20 | 26 | Button to 3V3 |
 | Steam button | GP21 | 27 | Button to 3V3 |
+| Sound data | GP11 | 15 | MAX98357A DIN |
+| Sound bit clock | GP12 | 16 | MAX98357A BCLK |
+| Sound word clock | GP13 | 17 | MAX98357A LRC. Must be the pin after BCLK |
 | Serial log TX | GP0 | 1 | Debug Probe UART RX |
 | Serial log RX | GP1 | 2 | Debug Probe UART TX |
 
@@ -66,6 +71,7 @@ Power: the Pico sits on a carrier PCB with a 5 V rail, fed by a 5 V 5 A DC suppl
 - **OLED and MAX6675:** VCC to **3V3(OUT), pin 36**, GND to any GND pin. Don't power the OLED from 5 V: its on-board pull-ups would put 5 V on GP8/GP9.
 - **Relay module:** the coils run from the 5 V rail, not the Pico's 3.3 V regulator. Only the IN signals connect to the GPIOs.
 - **Ring and status LEDs:** 5 V and GND from the rail, not through the Pico. They draw about 0.4 A at the default brightness and up to about 1.4 A at full white, well within the 5 A supply. A 100-1000 µF capacitor across the LEDs' 5 V and GND is good practice. Most WS2812Bs accept the Pico's 3.3 V data signal on a short wire. If yours flicker or show the wrong colours, add a 74AHCT125 level shifter.
+- **MAX98357A:** VIN to the 5 V rail, GND to GND, and the speaker across its + and − outputs (neither side goes to ground). Leave SD and GAIN unconnected: the board then plays the average of left and right (the firmware sends the same sound to both) at 9 dB gain. Use the `Volume` setting to make it quieter.
 - **Buttons:** each one connects its GPIO to 3V3. The firmware turns on the internal pull-downs, so you don't need resistors.
 
 ## Using the machine
@@ -73,11 +79,13 @@ Power: the Pico sits on a carrier PCB with a 5 V rail, fed by a 5 V 5 A DC suppl
 | Button | Short press | Hold 2 s |
 |---|---|---|
 | **Grind** | Grind one dose (press again to stop early) | |
-| **Coffee** | Start a shot (press again to stop). Acts when you let go | Switch to standby from any state, without starting the pump |
+| **Coffee** | Press once for an espresso, twice quickly for a long coffee. Press again during the shot to stop it. Acts when you let go | Switch to standby from any state, without starting the pump |
 | **Water** | Hot water through the wand (press again to stop) | |
 | **Steam** | Heat for steam; press again to leave steam mode | |
 
 Coffee acts when you let go of it, not when you press it, so that a 2 s hold for standby can't start a shot first. The other buttons act as soon as you press them.
+
+A long coffee has the same pre-infuse and soak as an espresso, with a longer extract (45 s by default). The first press starts the shot straight away, and a second press within 0.6 s (`DOUBLE_PRESS_MS`) turns it into a long coffee. After that, pressing Coffee stops the shot as usual. The display shows **ESPRESSO** or **LONG COFFEE** during the shot.
 
 Any button wakes the machine from standby. It heats to brew temperature and shows **READY** when it's there. For steam, wait for **STEAM RDY**, then open the steam knob. When you leave steam mode the machine shows **COOL DOWN** until it's back to brew temperature. Pressing Water during cool-down flushes water through the wand to speed this up.
 
@@ -131,6 +139,24 @@ The ring lights warm white whenever the machine is on, and goes off in standby.
 
 At start-up all the LEDs run a test pattern until you press any button. That press only stops the test, it doesn't wake the machine. The test lights every LED red, green, blue, then white for 1 s each, which checks every colour channel. Then a single white LED walks from the first ring LED to the last status LED, which checks the wiring order and the LED count. The test runs at low brightness (`LED_TEST_BRIGHTNESS`), so it draws only about 90 mA and can run from the Pico's USB alone.
 
+### Sound
+
+With a MAX98357A amplifier fitted, the machine plays:
+
+| When | Sound |
+|---|---|
+| **READY** or **STEAM RDY** after warming up | A rising chime |
+| A fault | A two-tone alarm, three times |
+| The first **READY** of the day in December | Jingle Bells instead of the chime |
+
+The chime only plays after a real warm-up of 10 s or more (`CHIME_AFTER_MS`), so it doesn't sound after every grind. The seasonal tune needs the date, which the controller gets from network time (`pool.ntp.org`) once it's on Wi-Fi. Until then, and without Wi-Fi, it plays the chime.
+
+Set the volume on the web page, from 0 (silent) to 100 %. The **Sound** card on the web page has a button for each tune, to try them out. It plays at the saved volume, so save a new volume before trying it.
+
+Tunes are [RTTTL](https://en.wikipedia.org/wiki/Ring_Tone_Text_Transfer_Language) strings in the `TUNES` table, the ringtone format of old mobile phones, so many tunes are available ready to paste. To add a seasonal tune, add it to `TUNES`, then add a row to `SEASONAL_TUNES` with its month and first and last day. For example, `{10, 31, 31, "halloween"}` plays a tune called `halloween` on 31 October. The dates are UTC unless you set `UTC_OFFSET_MIN`.
+
+The sound is made by the Pico itself: each note is a sine wave with a little of its second and third harmonics, and fades like a struck bell. PIO sends it to the amplifier over I2S, and DMA feeds the PIO, so playing a tune takes almost no processor time and the main loop's pauses don't affect it.
+
 ## State machine
 
 ```mermaid
@@ -173,7 +199,8 @@ The firmware is in [`PicoCoffeeZanussi.cpp`](PicoCoffeeZanussi.cpp), with the we
 - **`LED_STYLES` table:** the colour and pattern for each state on the status LEDs.
 - **`update_heater()`:** the PID controller. It sets the heater power toward the current state's target, and sets zero power whenever the temperature reading is invalid.
 - **`heater_step()`:** the delta-sigma output, run from a timer interrupt once per mains cycle.
-- **`DEFAULT_SETTINGS` and `SETTING_FIELDS`:** the settings that can be changed from the web page, with their defaults and allowed ranges. To add a setting, add it to `Settings`, `DEFAULT_SETTINGS` and `SETTING_FIELDS`, and the web page shows it automatically.
+- **`DEFAULT_SETTINGS` and `SETTING_FIELDS`:** the settings that can be changed from the web page, with their defaults and allowed ranges. To add a setting, add it to the end of `Settings`, then to `DEFAULT_SETTINGS` and `SETTING_FIELDS`, and the web page shows it automatically. Settings saved before then keep their values, and the new one starts at its default.
+- **`TUNES` and `SEASONAL_TUNES`:** the tunes, and which dates play which. `sound_on_state()` chooses the sound for each state change.
 - **`http_handle()`:** the web server's routes.
 
 ## Heater control
@@ -232,6 +259,8 @@ The page uses a small JSON API, which you can also call yourself:
 | `GET /api/settings` | Current `values`, `defaults`, and the `fields` with their labels, units and limits |
 | `POST /api/settings` | Changes settings. Form-encoded body, for example `brew_temp_c=93&kp=0.1`. Settings left out stay as they are, and nothing changes if any value is out of range |
 | `POST /api/settings/reset` | Restores the defaults |
+| `GET /api/sound` | The tune names, whether a tune is playing, and the date if it's known |
+| `POST /api/sound` | Plays a tune, for example `tune=jingle_bells` |
 | `POST /api/relay` | [Relay test mode](#relay-test) only: switches a relay, for example `relay=pump&on=1`. `relay` is `pump`, `valve` or `grinder` |
 
 Times are in seconds in the API.
@@ -336,16 +365,18 @@ Logging goes to both UART0 (GP0/GP1, 115200 baud) and USB. With a Debug Probe, o
 
 ## Configuration
 
-The temperatures, PID gains and step times are settings: change them on the [web page](#web-interface), or change their defaults in `DEFAULT_SETTINGS`.
+The temperatures, PID gains, step times and volume are settings: change them on the [web page](#web-interface), or change their defaults in `DEFAULT_SETTINGS`.
 
 | Setting | Default | Allowed |
 |---|---|---|
-| Brew temperature | 95 °C | 85-100 °C |
-| Steam temperature | 140 °C | 110-150 °C |
-| Kp / Ki / Kd | 0.08 / 0.002 / 0.2 | 0-1 / 0-0.05 / 0-5, see [Heater control](#heater-control) |
-| Grind | 12 s | 1-60 s |
+| Brew temperature | 97 °C | 85-100 °C |
+| Steam temperature | 120 °C | 110-150 °C |
+| Kp / Ki / Kd | 0.04 / 0.0004 / 0.4 | 0-1 / 0-0.05 / 0-5, see [Heater control](#heater-control) |
+| Grind | 6.5 s | 1-60 s |
 | Pre-infuse / Soak / Extract | 3 s / 2 s / 25 s | 1-10 s / 1-20 s / 5-60 s |
+| Extract, long coffee | 45 s | 10-120 s |
 | Hot water | 30 s | 5-120 s |
+| Volume | 30 % | 0-100 % |
 
 Everything else is a constant at the top of `PicoCoffeeZanussi.cpp`.
 
@@ -355,6 +386,7 @@ Everything else is a constant at the top of `PicoCoffeeZanussi.cpp`.
 | `OVER_TEMP_C` | 165 °C | Safety cut-out |
 | `HEATER_STEP_MS` | 20 ms | One mains cycle: 20 for 50 Hz, 17 for 60 Hz |
 | `HEAT_TIMEOUT_MS` | 5 min | Fault if not at temperature by then |
+| `DOUBLE_PRESS_MS` | 0.6 s | A second Coffee press this soon after the first makes a long coffee |
 | `IDLE_MS` / `STEAM_IDLE_MS` | 30 min / 3 min | Auto standby / leave steam mode |
 | `RING_COUNT` | 16 | Number of LEDs in the lamp ring |
 | `RING_R` / `RING_G` / `RING_B` | 255 / 160 / 60 | Lamp colour (warm white) |
@@ -364,6 +396,8 @@ Everything else is a constant at the top of `PicoCoffeeZanussi.cpp`.
 | `LED_TEST_BRIGHTNESS` | 16 | Brightness of the start-up LED test, 0-255 |
 | `OLED_COLUMN_OFFSET` | 2 | 2 for an SH1106 (1.3"), 0 for an SSD1306 (0.96") |
 | `OLED_ADDRESS` | `0x3C` | Some modules use `0x3D` |
+| `CHIME_AFTER_MS` | 10 s | Chime at READY only after warming up for at least this long |
+| `UTC_OFFSET_MIN` | 0 | Your time zone in minutes, for the seasonal tunes' dates: 60 for CET, -300 for EST |
 
 The times and temperatures are starting points. Tune them for your grind and beans.
 
@@ -384,6 +418,7 @@ The firmware assumes the group solenoid opens the path to the group head only wh
 | `Wi-Fi: wrong password` / `network ... not found` | Check `wifi_config.h`. The Pico 2 W only uses 2.4 GHz networks |
 | `MQTT: connection to ... failed (5)` | Wrong `MQTT_USER` or `MQTT_PASSWORD` |
 | `MQTT: can't find broker` or no `MQTT: connected` | Check `MQTT_HOST` is the broker's IP address and the broker is running |
+| No sound | Check the `Sound (I2S)` line in the serial log, the `Volume` setting, and the MAX98357A's 5 V. BCLK and LRC swapped gives silence |
 | `zanussi.local` doesn't open | Some networks and older Android phones don't support mDNS names. Use the IP address from the serial log |
 
 ## License

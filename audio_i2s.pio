@@ -1,0 +1,43 @@
+; I2S output, 16-bit stereo: one 32-bit FIFO word per frame, left sample in the top half.
+; Data on one pin, BCLK and LRCLK on two consecutive pins (side-set). Two PIO cycles per bit,
+; so the state machine runs at sample rate x 64.
+
+.program audio_i2s
+.side_set 2
+
+                    ;        /--- LRCLK
+                    ;        |/-- BCLK
+bitloop1:           ;        ||
+    out pins, 1       side 0b10
+    jmp x-- bitloop1  side 0b11
+    out pins, 1       side 0b00
+    set x, 14         side 0b01
+
+bitloop0:
+    out pins, 1       side 0b00
+    jmp x-- bitloop0  side 0b01
+    out pins, 1       side 0b10
+public entry_point:
+    set x, 14         side 0b11
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void audio_i2s_program_init(PIO pio, uint sm, uint offset, uint data_pin, uint clock_pin_base,
+                                          uint sample_rate) {
+    pio_sm_config c = audio_i2s_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, data_pin, 1);
+    sm_config_set_sideset_pins(&c, clock_pin_base);
+    sm_config_set_out_shift(&c, false, true, 32);  // MSB first, autopull every frame
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / (sample_rate * 64.0f));
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_gpio_init(pio, data_pin);
+    pio_gpio_init(pio, clock_pin_base);
+    pio_gpio_init(pio, clock_pin_base + 1);
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, clock_pin_base, 2, true);
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset + audio_i2s_offset_entry_point));
+}
+%}
